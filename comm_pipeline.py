@@ -1,7 +1,36 @@
+"""
+This is a simple example script showing how to
+
+    * Connect to a SPIKE™ Prime hub over BLE
+    * Subscribe to device notifications
+    * Transfer and start a new program
+
+The script is heavily simplified and not suitable for production use.
+
+----------------------------------------------------------------------
+
+After prompting for confirmation to continue, the script will simply connect to
+the first device it finds advertising the SPIKE™ Prime service UUID, and proceed
+with the following steps:
+
+    1. Request information about the device (e.g. max chunk size for file transfers)
+    2. Subscribe to device notifications (e.g. state of IMU, display, sensors, motors, etc.)
+    3. Clear the program in a specific slot
+    4. Request transfer of a new program file to the slot
+    5. Transfer the program in chunks
+    6. Start the program
+
+If the script detects an unexpected response, it will print an error message and exit.
+Otherwise it will continue to run until the connection is lost or stopped by the user.
+(You can stop the script by pressing Ctrl+C in the terminal.)
+
+While the script is running, it will print information about the messages it sends and receives.
+"""
+
 import sys
 from typing import cast, TypeVar
 
-TMessage = TypeVar('TMessage', bound='BaseMessage')
+TMessage = TypeVar("TMessage", bound="BaseMessage")
 
 import cobs
 from messages import *
@@ -13,198 +42,193 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
-SEARCH_TIMEOUT = 25.0
+
+SCAN_TIMEOUT = 10.0
+"""How long to scan for devices before giving up (in seconds)"""
+
+SERVICE = "0000fd02-0000-1000-8000-00805f9b34fb"
+"""The SPIKE™ Prime BLE service UUID"""
+
+RX_CHAR = "0000fd02-0001-1000-8000-00805f9b34fb"
+"""The UUID the hub will receive data on"""
+
+TX_CHAR = "0000fd02-0002-1000-8000-00805f9b34fb"
+"""The UUID the hub will transmit data on"""
+
 DEVICE_NOTIFICATION_INTERVAL_MS = 5000
-DEVICE_PROGRAM_SLOT = 0
+"""The interval in milliseconds between device notifications"""
 
-'''
-Add logging to this application
-'''
+EXAMPLE_SLOT = 2
+"""The slot to upload the example program to"""
 
-
-PROGRAM_TO_SEND = \
-"""#
-import motor
+EXAMPLE_PROGRAM = \
+"""import motor
 from hub import port
 import time
 
-motor.run_for_degrees(port.B, 360, 50)
+motor.run_for_degrees(port.E, 360, 50)
 time.sleep(0.5)
-""".encode('utf8')
+""".encode("utf8")
+"""The utf8-encoded example program to upload to the hub"""
 
-
-'''
-The LEGO® SPIKE™ Prime Hub exposes a BLE GATT service that contains two characteristics:
-- RX (for receiving data)
-- TX (for transmitting data)
-
-The dict below cotains the UUIDS for the service and characteristics.
-'''
-LEGO_SPIKE_UUIDs = {
-    'Service' : '0000FD02-0000-1000-8000-00805F9B34FB',
-    'RX'      : '0000FD02-0001-1000-8000-00805F9B34FB',
-    'TX'      : '0000FD02-0002-1000-8000-00805F9B34FB'
-}
-
-user_conscent = input(
-    f"This example will override the program in slot {DEVICE_PROGRAM_SLOT} of the first hub found. Do you want to continue? [Y/n] "
+answer = input(
+    f"This example will override the program in slot {EXAMPLE_SLOT} of the first hub found. Do you want to continue? [Y/n] "
 )
-if user_conscent.strip().lower().startswith("n"):
+if answer.strip().lower().startswith("n"):
     print("Aborted by user.")
     sys.exit(0)
 
 stop_event = asyncio.Event()
 
-def _match_service_uuid(device: BLEDevice, adv: AdvertisementData) -> bool:
-    return LEGO_SPIKE_UUIDs['Service'].lower() in [u.lower() for u in adv.service_uuids]
-
-async def _scan_for_device() -> BLEDevice:
-    print(f"\nScanning for {SEARCH_TIMEOUT} seconds, please wait...")
-    return await BleakScanner.find_device_by_filter(filterfunc=_match_service_uuid, timeout=SEARCH_TIMEOUT)
-
-def _on_disconnect(client: BleakClient) -> None:
-    print(f"Disconnected from {client.address}")
-    stop_event.set()
-
-
 async def main():
-    try:
-        device = await _scan_for_device()
-    except Exception as e:
-        print(f"Error: establishing control of bluetooth {e}")
-        print("Ensure bluetooth is enabled in settings before runnning the program.")
-        sys.exit(1)
-    
+
+    def match_service_uuid(device: BLEDevice, adv: AdvertisementData) -> bool:
+        return SERVICE.lower() in adv.service_uuids
+
+    print(f"\nScanning for {SCAN_TIMEOUT} seconds, please wait...")
+    device = await BleakScanner.find_device_by_filter(
+        filterfunc=match_service_uuid, timeout=SCAN_TIMEOUT
+    )
+
     if device is None:
-        print("No devices detected. Ensure that a device is within range, turned on, and awaiting connection.")
+        print(
+            "No hubs detected. Ensure that a hub is within range, turned on, and awaiting connection."
+        )
         sys.exit(1)
 
     device = cast(BLEDevice, device)
-    
-    print("Device Detected!")
+    print(f"Hub detected! {device}")
+
+    def on_disconnect(client: BleakClient) -> None:
+        print("Connection lost.")
+        stop_event.set()
+
     print("Connecting...")
-    async with BleakClient(device, disconnected_callback=_on_disconnect) as client:
-        print(f"Connected to {client.address}")
+    async with BleakClient(device, disconnected_callback=on_disconnect) as client:
+        print("Connected!\n")
 
-        await client.get_services()
-        service = client.services.get_service(LEGO_SPIKE_UUIDs['Service'])
-        rx = service.get_characteristic(LEGO_SPIKE_UUIDs['RX'])
-        tx = service.get_characteristic(LEGO_SPIKE_UUIDs['TX'])
+        service = client.services.get_service(SERVICE)
+        rx_char = service.get_characteristic(RX_CHAR)
+        tx_char = service.get_characteristic(TX_CHAR)
 
-        pending_responses: dict[int, asyncio.Future] = {}
+        # simple response tracking
+        pending_response: tuple[int, asyncio.Future] = (-1, asyncio.Future())
 
+        # callback for when data is received from the hub
         def on_data(_: BleakGATTCharacteristic, data: bytearray) -> None:
             if data[-1] != 0x02:
-                '''
-                TODO:
-                    - Implement buffering here so that the program can handle fragmentation correctly.
-                    - My thought: Add a bytearray buffer to accumulate unitl a frame delimiter is detected.
-                '''
-                un_xor = bytes(map(lambda x: x ^ 3, data))
-                print(f"Recieved incomplete message:\n {un_xor}")
+                # packet is not a complete message
+                # for simplicity, this example does not implement buffering
+                # and is therefore unable to handle fragmented messages
+                un_xor = bytes(map(lambda x: x ^ 3, data))  # un-XOR for debugging
+                print(f"Received incomplete message:\n {un_xor}")
                 return
 
             data = cobs.unpack(data)
-
             try:
                 message = deserialize(data)
                 print(f"Received: {message}")
-
-                if message.ID in pending_responses:
-                    pending_responses[message.ID].set_result(message)
-                    del pending_responses[message.ID]
+                if message.ID == pending_response[0]:
+                    pending_response[1].set_result(message)
 
                 if isinstance(message, DeviceNotification):
-                    # sort the messages and print
+                    # sort and print the messages in the notification
                     updates = list(message.messages)
-                    updates.sort(key=lambda x:x[1])
-                    lines: list[str] = [f" - {x[0]:<10}" for x in updates]
+                    updates.sort(key=lambda x: x[1])
+                    lines = [f" - {x[0]:<10}: {x[1]}" for x in updates]
                     print("\n".join(lines))
-            except Exception as e:
-               print(f"Error while handling message: {e}")
 
+            except ValueError as e:
+                print(f"Error: {e}")
 
-        await client.start_notify(tx, on_data)
+        # enable notifications on the hub's TX characteristic
+        await client.start_notify(tx_char, on_data)
 
+        # to be initialized
         info_response: InfoResponse = None
 
-        '''
-        Serialize and pack a message, then send it to the device.
-        '''
+        # serialize and pack a message, then send it to the hub
         async def send_message(message: BaseMessage) -> None:
-            print(f"Sending {message}")
-
+            print(f"Sending: {message}")
             payload = message.serialize()
             frame = cobs.pack(payload)
 
+            # use the max_packet_size from the info response if available
+            # otherwise, assume the frame is small enough to send in one packet
             packet_size = info_response.max_packet_size if info_response else len(frame)
 
+            # send the frame in packets of packet_size
             for i in range(0, len(frame), packet_size):
                 packet = frame[i : i + packet_size]
-                await client.write_gatt_char(rx, packet, response=False)
+                await client.write_gatt_char(rx_char, packet, response=False)
 
-        '''
-        Sending a message and waiting for an appropriate response.
-        '''
-        async def send_request(message: BaseMessage, response_type: type[TMessage]) -> TMessage:
-            fut = asyncio.Future()
-            pending_responses[response_type.ID] = fut
+        # send a message and wait for a response of a specific type
+        async def send_request(
+            message: BaseMessage, response_type: type[TMessage]
+        ) -> TMessage:
+            nonlocal pending_response
+            pending_response = (response_type.ID, asyncio.Future())
             await send_message(message)
-            return await fut
-        
+            return await pending_response[1]
 
-        '''
-        The first message should be an info request.
-        The response will contain important information about the device
-        and how to communicate with it.
-        '''
-        info_request = await send_request(InfoRequest(), InfoResponse)
+        # first message should always be an info request
+        # as the response contains important information about the hub
+        # and how to communicate with it
+        info_response = await send_request(InfoRequest(), InfoResponse)
 
+        # enable device notifications
         notification_response = await send_request(
             DeviceNotificationRequest(DEVICE_NOTIFICATION_INTERVAL_MS),
-            DeviceNotificationRequest
+            DeviceNotificationResponse,
         )
         if not notification_response.success:
             print("Error: failed to enable notifications")
             sys.exit(1)
 
-        clear_response = await send_request(ClearSlotRequest(DEVICE_PROGRAM_SLOT), ClearSlotResponse)
+        # clear the program in the example slot
+        clear_response = await send_request(
+            ClearSlotRequest(EXAMPLE_SLOT), ClearSlotResponse
+        )
         if not clear_response.success:
-            print("Failed to clear program slot. This could mean it is already empty, proceeding...")
+            print(
+                "ClearSlotRequest was not acknowledged. This could mean the slot was already empty, proceeding..."
+            )
 
-        program_crc = crc(PROGRAM_TO_SEND)
+        # start a new file upload
+        program_crc = crc(EXAMPLE_PROGRAM)
         start_upload_response = await send_request(
-            StartFileUploadRequest("program1.py", DEVICE_PROGRAM_SLOT, program_crc),
-            StartFileUploadResponse
+            StartFileUploadRequest("program.py", EXAMPLE_SLOT, program_crc),
+            StartFileUploadResponse,
         )
         if not start_upload_response.success:
-            print("Error: File upload failed.")
+            print("Error: start file upload was not acknowledged")
             sys.exit(1)
 
+        # transfer the program in chunks
         running_crc = 0
-        for i in range(0, len(PROGRAM_TO_SEND), info_response.max_chunk_size):
-            chunk = PROGRAM_TO_SEND[i : i + info_response.max_chunk_size]
+        for i in range(0, len(EXAMPLE_PROGRAM), info_response.max_chunk_size):
+            chunk = EXAMPLE_PROGRAM[i : i + info_response.max_chunk_size]
             running_crc = crc(chunk, running_crc)
-            chunk_response = await send_request(TransferChunkRequest(running_crc, chunk), TransferChunkResponse)
+            chunk_response = await send_request(
+                TransferChunkRequest(running_crc, chunk), TransferChunkResponse
+            )
             if not chunk_response.success:
                 print(f"Error: failed to transfer chunk {i}")
                 sys.exit(1)
 
+        # start the program
         start_program_response = await send_request(
-            ProgramFlowRequest(stop=False, slot=DEVICE_PROGRAM_SLOT), ProgramFlowResponse
+            ProgramFlowRequest(stop=False, slot=EXAMPLE_SLOT), ProgramFlowResponse
         )
         if not start_program_response.success:
             print("Error: failed to start program")
             sys.exit(1)
 
-        '''
-        Waiting for the program to terminate or device disconnect
-        '''
-
+        # wait for the user to stop the script or disconnect the hub
         await stop_event.wait()
-        await client.stop_notify(tx)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
