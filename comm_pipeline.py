@@ -1,34 +1,14 @@
-"""
-This is a simple example script showing how to
+'''
+This script was developed by Reid Russell
 
-    * Connect to a SPIKE™ Prime hub over BLE
-    * Subscribe to device notifications
-    * Transfer and start a new program
-
-The script is heavily simplified and not suitable for production use.
-
-----------------------------------------------------------------------
-
-After prompting for confirmation to continue, the script will simply connect to
-the first device it finds advertising the SPIKE™ Prime service UUID, and proceed
-with the following steps:
-
-    1. Request information about the device (e.g. max chunk size for file transfers)
-    2. Subscribe to device notifications (e.g. state of IMU, display, sensors, motors, etc.)
-    3. Clear the program in a specific slot
-    4. Request transfer of a new program file to the slot
-    5. Transfer the program in chunks
-    6. Start the program
-
-If the script detects an unexpected response, it will print an error message and exit.
-Otherwise it will continue to run until the connection is lost or stopped by the user.
-(You can stop the script by pressing Ctrl+C in the terminal.)
-
-While the script is running, it will print information about the messages it sends and receives.
-"""
+'''
 
 import sys
+import serial
 from typing import cast, TypeVar
+import queue
+import threading
+import time
 
 TMessage = TypeVar("TMessage", bound="BaseMessage")
 
@@ -43,45 +23,111 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 
-SCAN_TIMEOUT = 10.0
-"""How long to scan for devices before giving up (in seconds)"""
+SCAN_TIMEOUT = 25.0
 
+ARDUINO_PORT = 'COM3'
+
+ARDUINO_BAUDRATE = 9600
+
+# PID Controller parameters
+KP = 0.5
+KI = 0.1
+KD = 0.05
+SETPOINT_RANGE = (1200, 1400)  # Target flex sensor value range
+
+'''
+The SPIKE™ Prime BLE UUIDs
+ - service
+ - UUID that will recieve data
+ - UUID that will transmit data
+'''
 SERVICE = "0000fd02-0000-1000-8000-00805f9b34fb"
-"""The SPIKE™ Prime BLE service UUID"""
-
 RX_CHAR = "0000fd02-0001-1000-8000-00805f9b34fb"
-"""The UUID the hub will receive data on"""
-
 TX_CHAR = "0000fd02-0002-1000-8000-00805f9b34fb"
-"""The UUID the hub will transmit data on"""
+
 
 DEVICE_NOTIFICATION_INTERVAL_MS = 5000
-"""The interval in milliseconds between device notifications"""
 
-EXAMPLE_SLOT = 2
-"""The slot to upload the example program to"""
+PROGRAM_SLOT = 2
 
-EXAMPLE_PROGRAM = \
+PROGRAM_SAMPLE = \
 """import motor
 from hub import port
 import time
 
-motor.run_for_degrees(port.E, 360, 50)
+motor.run_for_degrees(port.E, 360, 100)
 time.sleep(0.5)
 """.encode("utf8")
-"""The utf8-encoded example program to upload to the hub"""
+
+class PIDController:
+    """A simple PID controller."""
+
+    def __init__(self, kp: float, ki: float, kd: float, setpoint_range: tuple[float, float]):
+        self.kp = kp # Proportional gain
+        self.ki = ki # Integral gain
+        self.kd = kd # Derivative gain
+        self.setpoint_range = setpoint_range
+        self.integral = 0
+        self.previous_error = 0
+
+    def update(self, current_value: float) -> float:
+        """Calculate the PID output."""
+        lower_bound, upper_bound = self.setpoint_range
+
+        if lower_bound <= current_value <= upper_bound:
+            error = 0
+            self.integral = 0
+        elif current_value < lower_bound:
+            error = lower_bound - current_value
+            self.integral += error
+        else:
+            error = upper_bound - current_value
+            self.integral += error
+
+        derivative = error - self.previous_error
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        self.previous_error = error
+        return output
+
+
+PROGRAM_RAISE_AND_RESET = \
+"""import motor
+from hub import port
+import time
+
+motor.run_for_degrees(port.E, -720, 100)
+time.sleep(5)
+""".encode("utf8")
+
 
 answer = input(
-    f"This example will override the program in slot {EXAMPLE_SLOT} of the first hub found. Do you want to continue? [Y/n] "
+    f"This example will override the program in slot {PROGRAM_SLOT} of the first hub found. Do you want to continue? [Y/n] "
 )
+
 if answer.strip().lower().startswith("n"):
     print("Aborted by user.")
     sys.exit(0)
 
 stop_event = asyncio.Event()
+# Add a global queue for serial data
+serial_queue = queue.Queue()
+
+def serial_reader(ser, stop_event):
+    """Read data from serial port and put it into a queue."""
+    while not stop_event.is_set():
+        try:
+            ser.write(b'g')
+            line = ser.readline().decode("ascii").strip()
+            if line:
+                serial_queue.put(line)
+            # Add a small delay to prevent busy-waiting
+            time.sleep(0.01)
+        except serial.SerialException:
+            print("Arduino disconnected. Retrying...")
+            time.sleep(2)
+            continue
 
 async def main():
-
     def match_service_uuid(device: BLEDevice, adv: AdvertisementData) -> bool:
         return SERVICE.lower() in adv.service_uuids
 
@@ -91,9 +137,7 @@ async def main():
     )
 
     if device is None:
-        print(
-            "No hubs detected. Ensure that a hub is within range, turned on, and awaiting connection."
-        )
+        print("No hubs detected. Ensure that a hub is within range, turned on, and awaiting connection.")
         sys.exit(1)
 
     device = cast(BLEDevice, device)
@@ -104,6 +148,13 @@ async def main():
         stop_event.set()
 
     print("Connecting...")
+    ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUDRATE, timeout=1)
+
+    # Start the serial reader thread
+    reader_thread = threading.Thread(target=serial_reader, args=(ser, stop_event))
+    reader_thread.daemon = True
+    reader_thread.start()
+
     async with BleakClient(device, disconnected_callback=on_disconnect) as client:
         print("Connected!\n")
 
@@ -111,28 +162,22 @@ async def main():
         rx_char = service.get_characteristic(RX_CHAR)
         tx_char = service.get_characteristic(TX_CHAR)
 
-        # simple response tracking
         pending_response: tuple[int, asyncio.Future] = (-1, asyncio.Future())
 
-        # callback for when data is received from the hub
         def on_data(_: BleakGATTCharacteristic, data: bytearray) -> None:
             if data[-1] != 0x02:
-                # packet is not a complete message
-                # for simplicity, this example does not implement buffering
-                # and is therefore unable to handle fragmented messages
-                un_xor = bytes(map(lambda x: x ^ 3, data))  # un-XOR for debugging
+                un_xor = bytes(map(lambda x: x ^ 3, data))
                 print(f"Received incomplete message:\n {un_xor}")
                 return
-
             data = cobs.unpack(data)
             try:
                 message = deserialize(data)
                 print(f"Received: {message}")
+
                 if message.ID == pending_response[0]:
                     pending_response[1].set_result(message)
 
                 if isinstance(message, DeviceNotification):
-                    # sort and print the messages in the notification
                     updates = list(message.messages)
                     updates.sort(key=lambda x: x[1])
                     lines = [f" - {x[0]:<10}: {x[1]}" for x in updates]
@@ -141,90 +186,116 @@ async def main():
             except ValueError as e:
                 print(f"Error: {e}")
 
-        # enable notifications on the hub's TX characteristic
         await client.start_notify(tx_char, on_data)
 
-        # to be initialized
-        info_response: InfoResponse = None
-
-        # serialize and pack a message, then send it to the hub
-        async def send_message(message: BaseMessage) -> None:
-            print(f"Sending: {message}")
-            payload = message.serialize()
-            frame = cobs.pack(payload)
-
-            # use the max_packet_size from the info response if available
-            # otherwise, assume the frame is small enough to send in one packet
-            packet_size = info_response.max_packet_size if info_response else len(frame)
-
-            # send the frame in packets of packet_size
-            for i in range(0, len(frame), packet_size):
-                packet = frame[i : i + packet_size]
-                await client.write_gatt_char(rx_char, packet, response=False)
-
-        # send a message and wait for a response of a specific type
-        async def send_request(
-            message: BaseMessage, response_type: type[TMessage]
-        ) -> TMessage:
+        async def send_request_with_tracking(message, response_type):
+            """Send message and await response."""
             nonlocal pending_response
             pending_response = (response_type.ID, asyncio.Future())
-            await send_message(message)
+            payload = message.serialize()
+            frame = cobs.pack(payload)
+            await client.write_gatt_char(rx_char, frame, response=False)
             return await pending_response[1]
 
-        # first message should always be an info request
-        # as the response contains important information about the hub
-        # and how to communicate with it
-        info_response = await send_request(InfoRequest(), InfoResponse)
-
-        # enable device notifications
-        notification_response = await send_request(
+        # === INITIALIZE HUB CONNECTION ===
+        info_response: InfoResponse = await send_request_with_tracking(InfoRequest(), InfoResponse)
+        notif_resp = await send_request_with_tracking(
             DeviceNotificationRequest(DEVICE_NOTIFICATION_INTERVAL_MS),
-            DeviceNotificationResponse,
+            DeviceNotificationResponse
         )
-        if not notification_response.success:
+        if not notif_resp.success:
             print("Error: failed to enable notifications")
             sys.exit(1)
 
-        # clear the program in the example slot
-        clear_response = await send_request(
-            ClearSlotRequest(EXAMPLE_SLOT), ClearSlotResponse
-        )
-        if not clear_response.success:
-            print(
-                "ClearSlotRequest was not acknowledged. This could mean the slot was already empty, proceeding..."
+        # === UPLOAD + RUN HELPER ===
+        async def upload_and_run(program_code: bytes):
+            """Upload a program to the hub and start it."""
+            program_crc = crc(program_code)
+
+            start_upload = await send_request_with_tracking(
+                StartFileUploadRequest("program.py", PROGRAM_SLOT, program_crc),
+                StartFileUploadResponse
             )
 
-        # start a new file upload
-        program_crc = crc(EXAMPLE_PROGRAM)
-        start_upload_response = await send_request(
-            StartFileUploadRequest("program.py", EXAMPLE_SLOT, program_crc),
-            StartFileUploadResponse,
-        )
-        if not start_upload_response.success:
-            print("Error: start file upload was not acknowledged")
-            sys.exit(1)
+            if not start_upload.success:
+                print("Start upload failed")
+                return False
 
-        # transfer the program in chunks
-        running_crc = 0
-        for i in range(0, len(EXAMPLE_PROGRAM), info_response.max_chunk_size):
-            chunk = EXAMPLE_PROGRAM[i : i + info_response.max_chunk_size]
-            running_crc = crc(chunk, running_crc)
-            chunk_response = await send_request(
-                TransferChunkRequest(running_crc, chunk), TransferChunkResponse
+            running_crc = 0
+            for i in range(0, len(program_code), info_response.max_chunk_size):
+                chunk = program_code[i:i + info_response.max_chunk_size]
+                running_crc = crc(chunk, running_crc)
+
+                chunk_resp = await send_request_with_tracking(
+                    TransferChunkRequest(running_crc, chunk),
+                    TransferChunkResponse
+                )
+                
+                if not chunk_resp.success:
+                    print("Chunk failed")
+                    return False
+
+            start_resp = await send_request_with_tracking(
+                ProgramFlowRequest(stop=False, slot=PROGRAM_SLOT),
+                ProgramFlowResponse
             )
-            if not chunk_response.success:
-                print(f"Error: failed to transfer chunk {i}")
-                sys.exit(1)
+            if not start_resp.success:
+                print("Error: failed to start program")
+                return False
 
-        # start the program
-        start_program_response = await send_request(
-            ProgramFlowRequest(stop=False, slot=EXAMPLE_SLOT), ProgramFlowResponse
-        )
-        if not start_program_response.success:
-            print("Error: failed to start program")
-            sys.exit(1)
+            print("Program started successfully.")
+            return True
 
-        # wait for the user to stop the script or disconnect the hub
+        # === MAIN LOOP ===
+        async def monitor_flex_sensor():
+            """Continuously read Arduino data and adjust probe height using PID controller."""
+            pid = PIDController(KP, KI, KD, SETPOINT_RANGE)
+            motor_adjusting = False
+
+            while not stop_event.is_set():
+                if not motor_adjusting:
+                    try:
+                        # Get data from the queue
+                        line = serial_queue.get_nowait()
+                    except queue.Empty:
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    try:
+                        current_value = float(line)
+                    except ValueError:
+                        continue
+
+                    print(f"Flex sensor: {current_value}")
+
+                    # Calculate PID output
+                    output = pid.update(current_value)
+
+                    # Clamp the output to a reasonable range
+                    output = max(min(output, 300), -300)
+
+                    # If the output is significant, move the motor
+                    if abs(output) > 10:
+                        motor_adjusting = True
+                        degrees = int(output) % 20
+                        program_code = f"""import motor
+from hub import port
+import time
+
+motor.run_for_degrees(port.A, {degrees}, 400)
+time.sleep(0.1)
+""".encode("utf8")
+                        print(f"Adjusting motor by {degrees} degrees.")
+                        await upload_and_run(program_code)
+
+                        # Clear the queue after motor adjustment
+                        with serial_queue.mutex:
+                            serial_queue.queue.clear()
+                        motor_adjusting = False
+
+                await asyncio.sleep(1)
+
+        await monitor_flex_sensor()
         await stop_event.wait()
 
 
