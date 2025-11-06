@@ -1,14 +1,16 @@
-'''
-This script was developed by Reid Russell
+"""
+This script was developed by Reid Russell for research purposes at UTK
 
-'''
+"""
 
+import logging
+import logging.config
 import sys
 import serial
-from typing import cast, TypeVar
-import queue
 import threading
 import time
+from typing import cast, TypeVar
+import queue
 
 TMessage = TypeVar("TMessage", bound="BaseMessage")
 
@@ -24,16 +26,14 @@ from bleak.backends.scanner import AdvertisementData
 
 
 SCAN_TIMEOUT = 25.0
-
 ARDUINO_PORT = 'COM3'
-
 ARDUINO_BAUDRATE = 9600
 
 # PID Controller parameters
 KP = 0.5
 KI = 0.1
 KD = 0.05
-SETPOINT_RANGE = (1200, 1400)  # Target flex sensor value range
+SETPOINT_RANGE = (8000, 9500)  # Target flex sensor value range
 
 '''
 The SPIKE™ Prime BLE UUIDs
@@ -47,20 +47,28 @@ TX_CHAR = "0000fd02-0002-1000-8000-00805f9b34fb"
 
 
 DEVICE_NOTIFICATION_INTERVAL_MS = 5000
-
 PROGRAM_SLOT = 2
 
-PROGRAM_SAMPLE = \
-"""import motor
-from hub import port
-import time
+"""
+Setting up the logger from the log.conf file
+"""
+logging.config.fileConfig('log.conf')
+logger = logging.getLogger('pipeline_logger')
 
-motor.run_for_degrees(port.E, 360, 100)
-time.sleep(0.5)
-""".encode("utf8")
 
 class PIDController:
-    """A simple PID controller."""
+    """
+    A simple Proportional-Integral-Derivative(PID) controller class
+    
+    Variables:
+    - kp             : Proportional gain
+    - ki             : Integral gain
+    - kd             : Derivative gain
+    - setpoint_range : Resistance range we want to maintain throughout scan
+    - integral       : Sum of the error over time
+    - pe             : Previous iterations error
+    
+    """
 
     def __init__(self, kp: float, ki: float, kd: float, setpoint_range: tuple[float, float]):
         self.kp = kp # Proportional gain
@@ -68,7 +76,7 @@ class PIDController:
         self.kd = kd # Derivative gain
         self.setpoint_range = setpoint_range
         self.integral = 0
-        self.previous_error = 0
+        self.pe = 0
 
     def update(self, current_value: float) -> float:
         """Calculate the PID output."""
@@ -84,20 +92,10 @@ class PIDController:
             error = upper_bound - current_value
             self.integral += error
 
-        derivative = error - self.previous_error
+        derivative = error - self.pe
         output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
-        self.previous_error = error
+        self.pe = error
         return output
-
-
-PROGRAM_RAISE_AND_RESET = \
-"""import motor
-from hub import port
-import time
-
-motor.run_for_degrees(port.E, -720, 100)
-time.sleep(5)
-""".encode("utf8")
 
 
 answer = input(
@@ -109,21 +107,30 @@ if answer.strip().lower().startswith("n"):
     sys.exit(0)
 
 stop_event = asyncio.Event()
+
 # Add a global queue for serial data
 serial_queue = queue.Queue()
 
 def serial_reader(ser, stop_event):
-    """Read data from serial port and put it into a queue."""
+    """
+    Read data from serial port & enqueue data
+
+    Steps:
+        1. Request data
+        2. Receive resistance from arduino
+        3. Enqueue the resistance value
+        4. Repeat until termination
+    """
     while not stop_event.is_set():
         try:
             ser.write(b'g')
-            line = ser.readline().decode("ascii").strip()
-            if line:
-                serial_queue.put(line)
+            resistance = ser.readline().decode("ascii").strip()
+            if resistance:
+                serial_queue.put(resistance)
             # Add a small delay to prevent busy-waiting
             time.sleep(0.01)
         except serial.SerialException:
-            print("Arduino disconnected. Retrying...")
+            logger.warning("Arduino disconnected. Retrying...")
             time.sleep(2)
             continue
 
@@ -131,23 +138,23 @@ async def main():
     def match_service_uuid(device: BLEDevice, adv: AdvertisementData) -> bool:
         return SERVICE.lower() in adv.service_uuids
 
-    print(f"\nScanning for {SCAN_TIMEOUT} seconds, please wait...")
+    logger.info(f"Scanning for {SCAN_TIMEOUT} seconds, please wait...")
     device = await BleakScanner.find_device_by_filter(
         filterfunc=match_service_uuid, timeout=SCAN_TIMEOUT
     )
 
     if device is None:
-        print("No hubs detected. Ensure that a hub is within range, turned on, and awaiting connection.")
+        logger.error("No hubs detected. Ensure that a hub is within range, turned on, and awaiting connection.")
         sys.exit(1)
 
     device = cast(BLEDevice, device)
-    print(f"Hub detected! {device}")
+    logger.info(f"Hub detected! {device}")
 
     def on_disconnect(client: BleakClient) -> None:
-        print("Connection lost.")
+        logger.warning("Connection lost.")
         stop_event.set()
 
-    print("Connecting...")
+    logger.info("Connecting...")
     ser = serial.Serial(ARDUINO_PORT, ARDUINO_BAUDRATE, timeout=1)
 
     # Start the serial reader thread
@@ -156,8 +163,7 @@ async def main():
     reader_thread.start()
 
     async with BleakClient(device, disconnected_callback=on_disconnect) as client:
-        print("Connected!\n")
-
+        logger.info("Connected!")
         service = client.services.get_service(SERVICE)
         rx_char = service.get_characteristic(RX_CHAR)
         tx_char = service.get_characteristic(TX_CHAR)
@@ -167,12 +173,12 @@ async def main():
         def on_data(_: BleakGATTCharacteristic, data: bytearray) -> None:
             if data[-1] != 0x02:
                 un_xor = bytes(map(lambda x: x ^ 3, data))
-                print(f"Received incomplete message:\n {un_xor}")
+                logger.warning(f"Received incomplete message: {un_xor}")
                 return
             data = cobs.unpack(data)
             try:
                 message = deserialize(data)
-                print(f"Received: {message}")
+                logger.info(f"Received: {message}")
 
                 if message.ID == pending_response[0]:
                     pending_response[1].set_result(message)
@@ -181,10 +187,10 @@ async def main():
                     updates = list(message.messages)
                     updates.sort(key=lambda x: x[1])
                     lines = [f" - {x[0]:<10}: {x[1]}" for x in updates]
-                    print("\n".join(lines))
+                    logger.info("\n".join(lines))
 
             except ValueError as e:
-                print(f"Error: {e}")
+                logger.error(f"Error: {e}")
 
         await client.start_notify(tx_char, on_data)
 
@@ -218,7 +224,7 @@ async def main():
             )
 
             if not start_upload.success:
-                print("Start upload failed")
+                logger.error("Start upload failed")
                 return False
 
             running_crc = 0
@@ -232,7 +238,7 @@ async def main():
                 )
                 
                 if not chunk_resp.success:
-                    print("Chunk failed")
+                    logger.error("Chunk failed")
                     return False
 
             start_resp = await send_request_with_tracking(
@@ -240,10 +246,10 @@ async def main():
                 ProgramFlowResponse
             )
             if not start_resp.success:
-                print("Error: failed to start program")
+                logger.error("Error: failed to start program")
                 return False
 
-            print("Program started successfully.")
+            logger.info("Program started successfully.")
             return True
 
         # === MAIN LOOP ===
@@ -266,18 +272,18 @@ async def main():
                     except ValueError:
                         continue
 
-                    print(f"Flex sensor: {current_value}")
+                    logger.info(f"Flex sensor: {current_value}")
 
                     # Calculate PID output
                     output = pid.update(current_value)
 
                     # Clamp the output to a reasonable range
-                    output = max(min(output, 300), -300)
+                    output = max(min(output, 15), -15)
 
                     # If the output is significant, move the motor
-                    if abs(output) > 10:
+                    if abs(output) > 5:
                         motor_adjusting = True
-                        degrees = int(output) % 20
+                        degrees = int(output)
                         program_code = f"""import motor
 from hub import port
 import time
@@ -285,12 +291,13 @@ import time
 motor.run_for_degrees(port.A, {degrees}, 400)
 time.sleep(0.1)
 """.encode("utf8")
-                        print(f"Adjusting motor by {degrees} degrees.")
+                        logger.info(f"Adjusting motor by {degrees} degrees.")
                         await upload_and_run(program_code)
 
                         # Clear the queue after motor adjustment
                         with serial_queue.mutex:
                             serial_queue.queue.clear()
+
                         motor_adjusting = False
 
                 await asyncio.sleep(1)
@@ -303,5 +310,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Interrupted by user.")
+        logger.warning("Interrupted by user.")
         stop_event.set()
