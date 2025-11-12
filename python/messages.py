@@ -102,7 +102,6 @@ class InfoResponse(BaseMessage):
 
 class ClearSlotRequest(BaseMessage):
     ID = 0x46
-
     def __init__(self, slot: int):
         self.slot = slot
 

@@ -1,23 +1,33 @@
 package main
 
-import (
-	"hash/crc32"
-)
+// CRC calculates CRC32 for the given data, matching the Python implementation.
+func CRC(data []byte, runningCRC uint32, num int) uint32 {
+	if num == 4 {
+		// Pad data to a multiple of 4 bytes
+		remainder := len(data) % 4
+		if remainder > 0 {
+			padding := make([]byte, 4-remainder)
+			data = append(data, padding...)
+		}
 
-// CRC calculates the CRC32 of data with an optional seed and alignment.
-func CRC(data []byte, seed uint32, align int) uint32 {
-
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-
-	remainder := len(dataCopy) % align
-	if remainder != 0 {
-		padding := make([]byte, align-remainder)
-		dataCopy = append(dataCopy, padding...)
+		// Standard CRC32 implementation to match Python version
+		crcVal := 0xFFFFFFFF ^ runningCRC
+		for _, b := range data {
+			crcVal ^= uint32(b)
+			for i := 0; i < 8; i++ {
+				if crcVal&1 == 1 {
+					crcVal = (crcVal >> 1) ^ 0xEDB88320
+				} else {
+					crcVal >>= 1
+				}
+			}
+		}
+		return 0xFFFFFFFF ^ crcVal
 	}
-
-	table := crc32.MakeTable(crc32.IEEE)
-	crc := crc32.Update(seed, table, dataCopy)
-
-	return crc
+	// A different CRC calculation for num=1
+	crcVal := runningCRC
+	for _, b := range data {
+		crcVal = (crcVal + uint32(b))
+	}
+	return crcVal
 }

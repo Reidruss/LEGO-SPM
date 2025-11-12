@@ -37,10 +37,10 @@ func Encode(data []byte) []byte {
 			block++
 		}
 
-		if b <= DELIMITER || b > MAX_BLOCK_SIZE {
+		if b <= DELIMITER || block > MAX_BLOCK_SIZE {
 			if b <= DELIMITER {
 				delimeter_base := b * MAX_BLOCK_SIZE
-				block_offset := byte(block) * COBS_CODE_OFFSET
+				block_offset := byte(block) + COBS_CODE_OFFSET
 				buffer[code_index] = delimeter_base + block_offset
 			}
 			beginBlock()

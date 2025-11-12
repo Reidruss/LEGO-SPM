@@ -37,7 +37,7 @@ func (m InfoResponse) GetID() byte { return 0x01 }
 func (m InfoResponse) Serialize() []byte { return nil } // Response only
 
 func DeserializeInfoResponse(data []byte) (*InfoResponse, error) {
-	if len(data) < 18 {
+	if len(data) < 17 {
 		return nil, fmt.Errorf("data too short for InfoResponse")
 	}
 
@@ -255,8 +255,73 @@ func DeserializeDeviceNotificationResponse(data []byte) (*DeviceNotificationResp
 
 // DeviceMessage represents a parsed device message
 type DeviceMessage struct {
-	Name   string
-	Values []interface{}
+	Name    string
+	Payload interface{}
+}
+
+// Device-specific message structs
+type BatteryMessage struct {
+	ID      byte
+	Voltage byte
+}
+
+type IMUMessage struct {
+	ID     byte
+	Port   byte
+	Mode   byte
+	AccelX int16
+	AccelY int16
+	AccelZ int16
+	GyroX  int16
+	GyroY  int16
+	GyroZ  int16
+	Val7   int16
+	Val8   int16
+	Val9   int16
+	Val10  int16
+}
+
+type FiveByFiveMessage struct {
+	ID    byte
+	Grid [25]byte
+}
+
+type MotorMessage struct {
+	ID       byte
+	Port     byte
+	Mode     byte
+	Speed    int16
+	Position int16
+	AbsPos   int8
+	Power    int32
+}
+
+type ForceMessage struct {
+	ID    byte
+	Port  byte
+	Mode  byte
+	Value byte
+}
+
+type ColorMessage struct {
+	ID    byte
+	Port  byte
+	Mode  int8
+	Red   uint16
+	Green uint16
+	Blue  uint16
+}
+
+type DistanceMessage struct {
+	ID       byte
+	Port     byte
+	Distance int16
+}
+
+type ThreeByThreeMessage struct {
+	ID    byte
+	Port  byte
+	Grid [9]byte
 }
 
 // DeviceNotification (ID: 0x3C)
@@ -269,18 +334,51 @@ type DeviceNotification struct {
 func (m DeviceNotification) GetID() byte { return 0x3C }
 func (m DeviceNotification) Serialize() []byte { return nil }
 
-var deviceMessageMap = map[byte]struct {
-	name string
-	size int
+var deviceMessageDeserializers = map[byte]struct {
+	name         string
+	size         int
+	deserializer func([]byte) (interface{}, error)
 }{
-	0x00: {"Battery", 2},
-	0x01: {"IMU", 20},
-	0x02: {"5x5", 26},
-	0x0A: {"Motor", 12},
-	0x0B: {"Force", 4},
-	0x0C: {"Color", 9},
-	0x0D: {"Distance", 4},
-	0x0E: {"3x3", 11},
+	0x00: {"Battery", 2, func(b []byte) (interface{}, error) {
+		var msg BatteryMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x01: {"IMU", 23, func(b []byte) (interface{}, error) {
+		var msg IMUMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x02: {"5x5", 26, func(b []byte) (interface{}, error) {
+		var msg FiveByFiveMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x0A: {"Motor", 12, func(b []byte) (interface{}, error) {
+		var msg MotorMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x0B: {"Force", 4, func(b []byte) (interface{}, error) {
+		var msg ForceMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x0C: {"Color", 9, func(b []byte) (interface{}, error) {
+		var msg ColorMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x0D: {"Distance", 4, func(b []byte) (interface{}, error) {
+		var msg DistanceMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
+	0x0E: {"3x3", 11, func(b []byte) (interface{}, error) {
+		var msg ThreeByThreeMessage
+		err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &msg)
+		return msg, err
+	}},
 }
 
 func DeserializeDeviceNotification(data []byte) (*DeviceNotification, error) {
@@ -291,36 +389,40 @@ func DeserializeDeviceNotification(data []byte) (*DeviceNotification, error) {
 	size := binary.LittleEndian.Uint16(data[1:3])
 	payload := data[3:]
 
+	if len(payload) != int(size) {
+		return nil, fmt.Errorf("payload size mismatch: expected %d, got %d", size, len(payload))
+	}
+
 	dn := &DeviceNotification{
 		Size:     size,
 		Payload:  payload,
 		Messages: make([]DeviceMessage, 0),
 	}
 
-	// Parse device messages
 	remaining := payload
 	for len(remaining) > 0 {
 		msgID := remaining[0]
 
-		if info, ok := deviceMessageMap[msgID]; ok {
+		if info, ok := deviceMessageDeserializers[msgID]; ok {
 			if len(remaining) < info.size {
 				break
 			}
 
-			// For simplicity, just store the raw bytes as values
-			values := make([]interface{}, 0)
-			for i := 0; i < info.size; i++ {
-				values = append(values, remaining[i])
+			msgData := remaining[:info.size]
+			parsedMsg, err := info.deserializer(msgData)
+			if err != nil {
+				fmt.Printf("Error deserializing device message ID 0x%02X: %v\n", msgID, err)
+				break
 			}
 
 			dn.Messages = append(dn.Messages, DeviceMessage{
-				Name:   info.name,
-				Values: values,
+				Name:    info.name,
+				Payload: parsedMsg,
 			})
 
 			remaining = remaining[info.size:]
 		} else {
-			fmt.Printf("Unknown message ID: 0x%02X\n", msgID)
+			fmt.Printf("Unknown device message ID: 0x%02X\n", msgID)
 			break
 		}
 	}

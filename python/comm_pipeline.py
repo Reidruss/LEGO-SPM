@@ -14,9 +14,9 @@ import queue
 
 TMessage = TypeVar("TMessage", bound="BaseMessage")
 
-import python.cobs as cobs
-from python.messages import *
-from python.crc import crc
+import cobs
+from messages import *
+from crc import crc
 
 import asyncio
 from bleak import BleakClient, BleakScanner
