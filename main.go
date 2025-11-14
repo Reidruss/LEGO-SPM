@@ -628,7 +628,10 @@ func main() {
 	if current_value < SETPOINT_RANGE_LOW {
 		programCode := fmt.Sprintf(`import motor
 from hub import port
+import time
 motor.run(port.A, 100)
+while True:
+    time.sleep(1)
 `)
 		log.Println("Uploading calibration program to start motor...")
 		err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
@@ -750,3 +753,4 @@ time.sleep(0.1)
 		}
 	}
 }
+
