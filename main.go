@@ -636,6 +636,10 @@ motor.run(port.A, 100)
 			log.Fatalf("Failed to upload program to start motor: %v", err)
 		}
 		log.Println("Calibration program uploaded, motor should be running.")
+
+		// Clear any stale sensor data and wait for motor to start moving
+		serialQueue.Clear()
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	for {
@@ -667,7 +671,6 @@ motor.run(port.A, 100)
 		if current_value > SETPOINT_RANGE_LOW {
 			programCode := fmt.Sprintf(`import motor
 from hub import port
-
 motor.run(port.A, 0)
 `)
 			log.Println("Flex sensor detected contact. Stopping motor.")
@@ -687,7 +690,6 @@ motor.run(port.A, 0)
 	// Initialize PID controller
 	log.Println("Initializing PID controller...")
 	pid := NewPIDController(KP, KI, KD, SETPOINT_RANGE_LOW, SETPOINT_RANGE_HIGH)
-	motorAdjusting := false
 	log.Println("Starting main control loop...")
 
 	// Main control loop
@@ -701,32 +703,35 @@ motor.run(port.A, 0)
 			log.Println("Main loop cancelled.")
 			return
 		case <-ticker.C:
-			log.Println("Ticker ticked.")
-			if motorAdjusting {
-				continue
+			var latestValue string
+			var valueFound bool
+
+			// Drain the queue to get the latest value
+			for {
+				line, ok := serialQueue.Get()
+				if !ok {
+					break // Queue is empty
+				}
+				latestValue = line
+				valueFound = true
 			}
-			line, ok := serialQueue.Get()
-			if !ok {
+
+			if !valueFound {
 				log.Println("Serial queue empty.")
 				continue
 			}
 
-			currentValue, err := strconv.ParseFloat(line, 64)
+			currentValue, err := strconv.ParseFloat(latestValue, 64)
 			if err != nil {
+				log.Printf("Could not parse float in PID loop: %v", err)
 				continue
 			}
-
-
 
 			output := pid.Update(currentValue)
 			output = clamp(output, 20, -20)
 
 			if output > 5 || output < -5 {
-				motorAdjusting = true
 				degrees := int(output)
-				log.Printf("Moving: %.2d", degrees)
-
-
 				programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
@@ -739,12 +744,9 @@ time.sleep(0.1)
 
 				err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
 				if err != nil {
-					log.Printf("Failed to upload program: %v", err)
+					log.Printf("Failed to upload program for PID adjustment: %v", err)
 				}
-				motorAdjusting = false
 			}
-			serialQueue.Clear()
-			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
