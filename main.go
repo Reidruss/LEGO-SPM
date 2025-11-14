@@ -639,14 +639,28 @@ motor.run(port.A, 100)
 	}
 
 	for {
-		line, ok := serialQueue.Get()
-		if !ok {
-			time.Sleep(10 * time.Millisecond)
+		var latestValue string
+		var valueFound bool
+
+		// Drain the queue to get the latest value
+		for {
+			line, ok := serialQueue.Get()
+			if !ok {
+				break // Queue is empty
+			}
+			latestValue = line
+			valueFound = true
+		}
+
+		if !valueFound {
+			time.Sleep(50 * time.Millisecond) // Wait for new data if queue was empty
 			continue
 		}
-		current_value, err := strconv.ParseFloat(line, 64)
+
+		current_value, err := strconv.ParseFloat(latestValue, 64)
 		if err != nil {
 			log.Printf("Could not parse float: %v", err)
+			time.Sleep(50 * time.Millisecond) // Wait before trying again
 			continue
 		}
 
@@ -656,16 +670,16 @@ from hub import port
 
 motor.run(port.A, 0)
 `)
-
+			log.Println("Flex sensor detected contact. Stopping motor.")
 			err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
 			if err != nil {
-				log.Printf("Failed to upload program: %v", err)
+				log.Printf("Failed to upload program to stop motor: %v", err)
 			}
+			log.Println("Motor stopped. Calibration complete.")
 			break
 		}
 
-		serialQueue.Clear()
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond) // Wait before checking again
 	}
 
 	time.Sleep(500 * time.Millisecond)
