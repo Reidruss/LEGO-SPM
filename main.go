@@ -629,7 +629,7 @@ func main() {
 		programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
-motor.run(port.A, 100)
+motor.run(port.A, 50)
 while True:
     time.sleep(1)
 `)
@@ -674,7 +674,7 @@ while True:
 		if current_value > SETPOINT_RANGE_LOW {
 			programCode := fmt.Sprintf(`import motor
 from hub import port
-motor.run(port.A, 0)
+motor.stop(port.A)
 `)
 			log.Println("Flex sensor detected contact. Stopping motor.")
 			err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
