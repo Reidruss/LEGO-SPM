@@ -35,8 +35,8 @@ const (
 	KP                  = 0.5
 	KI                  = 0.1
 	KD                  = 0.05
-	SETPOINT_RANGE_LOW  = 4000
-	SETPOINT_RANGE_HIGH = 5500
+	SETPOINT_RANGE_LOW  = 3500
+	SETPOINT_RANGE_HIGH = 4000
 )
 
 // PIDController implements a PID controller
@@ -629,7 +629,7 @@ func main() {
 		programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
-motor.run(port.A, 50)
+motor.run(port.A, 75)
 while True:
     time.sleep(1)
 `)
