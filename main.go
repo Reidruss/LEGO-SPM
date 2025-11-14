@@ -604,13 +604,23 @@ func main() {
 
 
 	// We need to calibrate the flex sensor now.
-	line, ok := serialQueue.Get()
-	if (!ok) {
-		log.Fatalf("Aruduino is not producing outputs: %v", err)
+	log.Println("Waiting for initial sensor value from Arduino...")
+	var line string
+	var ok bool
+	for i := 0; i < 20; i++ { // Try for 2 seconds
+		line, ok = serialQueue.Get()
+		if ok {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	if !ok {
+		log.Fatalf("Arduino is not producing outputs. Aborting.")
+	}
+
 	current_value, err := strconv.ParseFloat(line, 64)
 	if err != nil {
-		log.Fatalf("Aruduino is not producing incorrect outputs: %v", err)
+		log.Fatalf("Arduino is producing incorrect output: %v", err)
 	}
 
 	log.Printf("Current Value: %.2f", current_value)
@@ -620,12 +630,12 @@ func main() {
 from hub import port
 motor.run(port.A, 100)
 `)
-
+		log.Println("Uploading calibration program to start motor...")
 		err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
-		log.Printf("Uploading Calibration Program:")
 		if err != nil {
-			log.Printf("Failed to upload program: %v", err)
+			log.Fatalf("Failed to upload program to start motor: %v", err)
 		}
+		log.Println("Calibration program uploaded, motor should be running.")
 	}
 
 	for {
