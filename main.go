@@ -35,8 +35,8 @@ const (
 	KP                  = 0.5
 	KI                  = 0.1
 	KD                  = 0.05
-	SETPOINT_RANGE_LOW  = 3500
-	SETPOINT_RANGE_HIGH = 4000
+	SETPOINT_RANGE_LOW  = 3250
+	SETPOINT_RANGE_HIGH = 3750
 )
 
 // PIDController implements a PID controller
@@ -426,11 +426,24 @@ func (b *BLEController) UploadAndRunWait(ctx context.Context, programCode []byte
 		Stop: false,
 	}
 	respBytesNotif, err := b.SendRequestWithResponse(programFlowNotif, ProgramFlowNotification{}.GetID())
+	if err != nil {
+		return fmt.Errorf("program flow request failed: %w", err)
+	}
 	flowRespNotif, err := DeserializeProgramFlowNotification(respBytesNotif)
+	if err != nil {
+		return fmt.Errorf("failed to deserialize program flow response: %w", err)
+	}
 
-	for flowRespNotif.Stop == true {
+	for flowRespNotif.Stop {
 		respBytesNotif, err = b.SendRequestWithResponse(programFlowNotif, ProgramFlowNotification{}.GetID())
+		if err != nil {
+			return fmt.Errorf("program flow request failed: %w", err)
+		}
+
 		flowRespNotif, err = DeserializeProgramFlowNotification(respBytesNotif)
+		if err != nil {
+			return fmt.Errorf("failed to deserialize program flow response: %w", err)
+		}
 	}
 
 	log.Println("Program started and ended successfully.")
@@ -626,13 +639,13 @@ func main() {
 	log.Printf("Current Value: %.2f", current_value)
 
 	if current_value < SETPOINT_RANGE_LOW {
-		programCode := fmt.Sprintf(`import motor
+		programCode := `import motor
 from hub import port
 import time
-motor.run(port.A, 75)
+motor.run(port.A, 50)
 while True:
     time.sleep(1)
-`)
+`
 		log.Println("Uploading calibration program to start motor...")
 		err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
 		if err != nil {
@@ -642,7 +655,7 @@ while True:
 
 		// Clear any stale sensor data and wait for motor to start moving
 		serialQueue.Clear()
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	for {
@@ -672,10 +685,10 @@ while True:
 		}
 
 		if current_value > SETPOINT_RANGE_LOW {
-			programCode := fmt.Sprintf(`import motor
+			programCode := `import motor
 from hub import port
 motor.stop(port.A)
-`)
+`
 			log.Println("Flex sensor detected contact. Stopping motor.")
 			err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
 			if err != nil {
@@ -704,6 +717,7 @@ motor.stop(port.A)
 		select {
 		case <-ctx.Done():
 			log.Println("Main loop cancelled.")
+			serialQueue.Clear()
 			return
 		case <-ticker.C:
 			var latestValue string
@@ -731,15 +745,14 @@ motor.stop(port.A)
 			}
 
 			output := pid.Update(currentValue)
-			output = clamp(output, 20, -20)
-
-			if output > 5 || output < -5 {
+			output = clamp(output, 5, -5)
+			if output != 0 {
 				degrees := int(output)
 				programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
 
-motor.run_for_degrees(port.A, %d, 100)
+motor.run_for_degrees(port.A, %d, 50)
 time.sleep(0.1)
 `, degrees)
 
