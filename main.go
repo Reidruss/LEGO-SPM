@@ -37,6 +37,7 @@ const (
 	KD                  = 0.05
 	SETPOINT_RANGE_LOW  = 4000
 	SETPOINT_RANGE_HIGH = 6000
+	MOTOR_SPEED         = 30
 )
 
 // PIDController implements a PID controller
@@ -579,10 +580,13 @@ func main() {
 		log.Fatalf("Failed to open serial port: %v", err)
 	}
 
-	// Flush the OS buffer to remove stale data from the previous run
-    if err := serialPort.Flush(); err != nil {
-        log.Printf("Warning: Failed to flush serial buffer: %v", err)
-    }
+    // --- NEW: FLUSH BUFFER ---
+    // Flush the OS buffer to remove stale data from the previous run
+    // This fixes the issue where it reads old values on restart
+	if err := serialPort.Flush(); err != nil {
+		log.Printf("Warning: Failed to flush serial buffer: %v", err)
+	}
+    // -------------------------
 
 	defer serialPort.Close()
 
@@ -615,14 +619,14 @@ func main() {
 	bleController.maxChunkSize = int(info.MaxChunkSize)
 	log.Printf("Set maxChunkSize from hub: %d", bleController.maxChunkSize)
 
-	// Fallback if InfoResponse didn't set it
 	if bleController.maxChunkSize == 0 {
-		bleController.maxChunkSize = MAX_BLOCK_SIZE // A sensible default
+		bleController.maxChunkSize = MAX_BLOCK_SIZE
 		log.Printf("Warning: maxChunkSize is 0, using fallback: %d", bleController.maxChunkSize)
 	}
 
-
-	// We need to calibrate the flex sensor now.
+    // =========================================================================
+    // CALIBRATION SEQUENCE
+    // =========================================================================
 	log.Println("Waiting for initial sensor value from Arduino...")
 	var line string
 	var ok bool
@@ -644,15 +648,16 @@ func main() {
 
 	log.Printf("Current Value: %.2f", current_value)
 
+    // Calibration: If too low, tighten until contact
 	if current_value < SETPOINT_RANGE_LOW {
-		programCode := `import motor
+		programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
-motor.run(port.A, -30)
-motor.run(port.C, 30)
+motor.run(port.A, -%d)
+motor.run(port.C, %d)
 while True:
     time.sleep(1)
-`
+`, MOTOR_SPEED, MOTOR_SPEED)
 		log.Println("Uploading calibration program to start motor...")
 		err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
 		if err != nil {
@@ -660,11 +665,11 @@ while True:
 		}
 		log.Println("Calibration program uploaded, motor should be running.")
 
-		// Clear any stale sensor data and wait for motor to start moving
 		serialQueue.Clear()
 		time.Sleep(20 * time.Millisecond)
 	}
 
+    // Monitor Calibration loop
 	for {
 		var latestValue string
 		var valueFound bool
@@ -680,14 +685,14 @@ while True:
 		}
 
 		if !valueFound {
-			time.Sleep(50 * time.Millisecond) // Wait for new data if queue was empty
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
 		current_value, err := strconv.ParseFloat(latestValue, 64)
 		if err != nil {
 			log.Printf("Could not parse float: %v", err)
-			time.Sleep(50 * time.Millisecond) // Wait before trying again
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
@@ -706,18 +711,17 @@ motor.stop(port.C, stop_action='hold')
 			break
 		}
 
-		time.Sleep(50 * time.Millisecond) // Wait before checking again
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	time.Sleep(500 * time.Millisecond)
 
-	// Initialize PID controller
-	log.Println("Initializing PID controller...")
-	pid := NewPIDController(KP, KI, KD, SETPOINT_RANGE_LOW, SETPOINT_RANGE_HIGH)
+    // =========================================================================
+    // MAIN CONTROL LOOP (Replaces PID with Threshold/Bang-Bang Logic)
+    // =========================================================================
 	log.Println("Starting main control loop...")
 
-	// Main control loop
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(250 * time.Millisecond) // Check 4 times a second
 	defer ticker.Stop()
 
 	log.Println("Entering main loop...")
@@ -742,37 +746,127 @@ motor.stop(port.C, stop_action='hold')
 			}
 
 			if !valueFound {
-				log.Println("Serial queue empty.")
 				continue
 			}
 
 			currentValue, err := strconv.ParseFloat(latestValue, 64)
 			if err != nil {
-				log.Printf("Could not parse float in PID loop: %v", err)
+				log.Printf("Could not parse float in main loop: %v", err)
 				continue
 			}
 
-			output := pid.Update(currentValue)
-			output = clamp(output, -10, 50)
-			if output != 0 {
-				degrees := int(output)
-				programCode := fmt.Sprintf(`import motor
+            // Case 1: Value is too LOW. (Needs to tighten)
+            // We reuse the exact logic from calibration.
+            if currentValue < SETPOINT_RANGE_LOW {
+                log.Printf("Value %.0f is LOW. Starting continuous adjustment...", currentValue)
+
+                // 1. Start Motor
+                programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
+motor.run(port.A, -%d)
+motor.run(port.C, %d)
+while True:
+    time.sleep(1)
+`, MOTOR_SPEED, MOTOR_SPEED)
 
-motor.run_for_degrees(port.A, %d, 100)
-motor.run_for_degrees(port.C, %d, 100)
+                err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
+                if err != nil {
+                    log.Printf("Failed to start motor: %v", err)
+                    continue
+                }
 
-time.sleep(0.1)
-`, degrees, -degrees)
+                // 2. Loop until back in range
+                for {
+                    // Quick read of queue
+                    var reading string
+                    var found bool
 
-				log.Printf("Adjusting motor by %d degrees", degrees)
+                    // Drain buffer
+                    for {
+                        l, ok := serialQueue.Get()
+                        if !ok { break }
+                        reading = l
+                        found = true
+                    }
 
-				err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
-				if err != nil {
-					log.Printf("Failed to upload program for PID adjustment: %v", err)
-				}
-			}
+                    if !found {
+                        time.Sleep(50 * time.Millisecond)
+                        continue
+                    }
+
+                    val, _ := strconv.ParseFloat(reading, 64)
+                    // Stop if we cross the low threshold back into safety
+                    if val >= SETPOINT_RANGE_LOW {
+                        break
+                    }
+                    time.Sleep(50 * time.Millisecond)
+                }
+
+                // 3. Stop Motor
+                stopCode := `import motor
+from hub import port
+motor.stop(port.A, stop_action='hold')
+motor.stop(port.C, stop_action='hold')
+`
+                bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+                log.Println("Adjustment complete. Stopping.")
+            }
+
+            // Case 2: Value is too HIGH. (Needs to loosen)
+            // Same logic, reversed direction.
+            if currentValue > SETPOINT_RANGE_HIGH {
+                log.Printf("Value %.0f is HIGH. Starting continuous adjustment...", currentValue)
+
+                // 1. Start Motor (Reversed)
+                programCode := fmt.Sprintf(`import motor
+from hub import port
+import time
+motor.run(port.A, %d)
+motor.run(port.C, -%d)
+while True:
+    time.sleep(1)
+`, MOTOR_SPEED, MOTOR_SPEED)
+
+                err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
+                if err != nil {
+                    log.Printf("Failed to start motor: %v", err)
+                    continue
+                }
+
+                // 2. Loop until back in range
+                for {
+                    var reading string
+                    var found bool
+                    for {
+                        l, ok := serialQueue.Get()
+                        if !ok { break }
+                        reading = l
+                        found = true
+                    }
+
+                    if !found {
+                        time.Sleep(50 * time.Millisecond)
+                        continue
+                    }
+
+                    val, _ := strconv.ParseFloat(reading, 64)
+                    // Stop if we cross the high threshold back into safety
+                    if val <= SETPOINT_RANGE_HIGH {
+                        break
+                    }
+                    time.Sleep(50 * time.Millisecond)
+                }
+
+                // 3. Stop Motor
+                stopCode := `import motor
+from hub import port
+motor.stop(port.A, stop_action='hold')
+motor.stop(port.C, stop_action='hold')
+`
+                bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+                log.Println("Adjustment complete. Stopping.")
+            }
 		}
 	}
 }
