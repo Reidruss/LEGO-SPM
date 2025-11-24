@@ -35,8 +35,8 @@ const (
 	KP                  = 0.5
 	KI                  = 0.1
 	KD                  = 0.05
-	SETPOINT_RANGE_LOW  = 3250
-	SETPOINT_RANGE_HIGH = 3750
+	SETPOINT_RANGE_LOW  = 4000
+	SETPOINT_RANGE_HIGH = 6000
 )
 
 // PIDController implements a PID controller
@@ -578,6 +578,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to open serial port: %v", err)
 	}
+
+	// Flush the OS buffer to remove stale data from the previous run
+    if err := serialPort.Flush(); err != nil {
+        log.Printf("Warning: Failed to flush serial buffer: %v", err)
+    }
+
 	defer serialPort.Close()
 
 	// Start serial reader
@@ -642,7 +648,8 @@ func main() {
 		programCode := `import motor
 from hub import port
 import time
-motor.run(port.A, 50)
+motor.run(port.A, -30)
+motor.run(port.C, 30)
 while True:
     time.sleep(1)
 `
@@ -687,7 +694,8 @@ while True:
 		if current_value > SETPOINT_RANGE_LOW {
 			programCode := `import motor
 from hub import port
-motor.stop(port.A)
+motor.stop(port.A, stop_action='hold')
+motor.stop(port.C, stop_action='hold')
 `
 			log.Println("Flex sensor detected contact. Stopping motor.")
 			err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
@@ -745,16 +753,18 @@ motor.stop(port.A)
 			}
 
 			output := pid.Update(currentValue)
-			output = clamp(output, 5, -5)
+			output = clamp(output, -10, 50)
 			if output != 0 {
 				degrees := int(output)
 				programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
 
-motor.run_for_degrees(port.A, %d, 50)
+motor.run_for_degrees(port.A, %d, 100)
+motor.run_for_degrees(port.C, %d, 100)
+
 time.sleep(0.1)
-`, degrees)
+`, degrees, -degrees)
 
 				log.Printf("Adjusting motor by %d degrees", degrees)
 
