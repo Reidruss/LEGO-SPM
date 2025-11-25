@@ -16,6 +16,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,8 +44,8 @@ const (
 // Threshold parameters
 const (
 	SETPOINT_RANGE_LOW  = 4000
-	SETPOINT_RANGE_HIGH = 8000
-	MOTOR_SPEED         = 55
+	SETPOINT_RANGE_HIGH = 5000
+	MOTOR_SPEED         = 50
 )
 
 // SerialQueue manages serial data in a thread-safe way
@@ -87,6 +89,90 @@ func mustParseUUID(s string) bluetooth.UUID {
 		panic(err)
 	}
 	return uuid
+}
+
+func findArduino() (string, error) {
+	var potentialPorts []string
+
+	if runtime.GOOS == "windows" {
+		// Windows: Check COM ports 1-32 (most common range)
+		for i := 1; i <= 32; i++ {
+			potentialPorts = append(potentialPorts, fmt.Sprintf("COM%d", i))
+		}
+	} else {
+		// Unix-like systems (Linux/macOS)
+		patterns := []string{
+			"/dev/ttyACM*",        // Linux Arduino
+			"/dev/ttyUSB*",        // Linux Serial Adapters
+			"/dev/tty.usbmodem*",  // macOS Arduino
+			"/dev/tty.usbserial*", // macOS Serial Adapters
+		}
+
+		for _, pattern := range patterns {
+			matches, _ := filepath.Glob(pattern)
+			potentialPorts = append(potentialPorts, matches...)
+		}
+	}
+
+	if len(potentialPorts) == 0 && runtime.GOOS != "windows" {
+		return "", fmt.Errorf("no serial devices found matching patterns")
+	}
+
+	log.Printf("Scanning %d potential ports for Arduino...", len(potentialPorts))
+
+	// 2. Iterate through them
+	for _, port := range potentialPorts {
+		c := &serial.Config{
+			Name:        port,
+			Baud:        ARDUINO_BAUDRATE,
+			ReadTimeout: 500 * time.Millisecond, // Short timeout for checking
+		}
+
+		s, err := serial.OpenPort(c)
+		if err != nil {
+			// On Windows, failed opens are common (port doesn't exist), so we can skip logging or log verbose only
+			if runtime.GOOS != "windows" {
+				log.Printf("  -> Failed to open %s: %v", port, err)
+			}
+			continue
+		}
+
+		log.Printf("Checking port %s...", port)
+
+		// 3. Handshake attempt
+		s.Flush()
+
+		// Write 'g' trigger
+		_, err = s.Write([]byte{'g'})
+		if err != nil {
+			s.Close()
+			continue
+		}
+
+		// Read response
+		buf := make([]byte, 128)
+		n, err := s.Read(buf)
+		s.Close() // Close immediately after check
+
+		if err != nil && err.Error() != "EOF" {
+			 log.Printf("  -> Read error on %s", port)
+			 continue
+		}
+
+		if n > 0 {
+			response := strings.TrimSpace(string(buf[:n]))
+			// Check if it looks like a number (sensor data)
+			if _, err := strconv.ParseFloat(response, 64); err == nil {
+				log.Printf("  -> FOUND! Valid sensor data on %s: '%s'", port, response)
+				return port, nil
+			}
+			 log.Printf("  -> Invalid response on %s: '%s'", port, response)
+		} else {
+			 log.Printf("  -> No response on %s", port)
+		}
+	}
+
+	return "", fmt.Errorf("arduino not found on any port")
 }
 
 // SerialReader reads from Arduino continuously
@@ -421,9 +507,16 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Open serial port
+	log.Println("Searching for Arduino...")
+    arduinoPortName, err := findArduino()
+    if err != nil {
+        log.Fatalf("Fatal: %v", err)
+    }
+    log.Printf("Target acquired: %s", arduinoPortName)
+
+	// Open serial port using the discovered name
 	config := &serial.Config{
-		Name:        ARDUINO_PORT,
+		Name:        arduinoPortName,
 		Baud:        ARDUINO_BAUDRATE,
 		ReadTimeout: 1 * time.Second,
 	}
