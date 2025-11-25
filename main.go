@@ -6,8 +6,10 @@
     Pipeline for communication from Arduino R4 to LEGO Spike Prime
       Flex Sensor --> Arduino --> main.go --> LEGO Spike Prime
 */
-
 package main
+
+
+/* ==== CONSTANTS + IMPORTS ==== */
 
 import (
 	"bufio"
@@ -30,7 +32,6 @@ import (
 
 const (
 	SCAN_TIMEOUT                    = 25 * time.Second
-	ARDUINO_PORT                    = "/dev/ttyACM0"
 	ARDUINO_BAUDRATE                = 9600
 	DEVICE_NOTIFICATION_INTERVAL_MS = 5000
 	PROGRAM_SLOT                    = 2
@@ -41,48 +42,16 @@ const (
 	TX_CHAR = "0000fd02-0002-1000-8000-00805f9b34fb"
 )
 
-// Threshold parameters
+// Threshold parameters & Motor Speed
 const (
-	SETPOINT_RANGE_LOW  = 4000
-	SETPOINT_RANGE_HIGH = 5000
+	SETPOINT_RANGE_LOW  = 3750
+	SETPOINT_RANGE_HIGH = 6000
 	MOTOR_SPEED         = 50
 )
 
-// SerialQueue manages serial data in a thread-safe way
-type SerialQueue struct {
-	mu   sync.Mutex
-	data []string
-}
 
-func NewSerialQueue() *SerialQueue {
-	return &SerialQueue{
-		data: make([]string, 0),
-	}
-}
 
-func (q *SerialQueue) Put(item string) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.data = append(q.data, item)
-}
-
-func (q *SerialQueue) Get() (string, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if len(q.data) == 0 {
-		return "", false
-	}
-	item := q.data[0]
-	q.data = q.data[1:]
-	return item, true
-}
-
-func (q *SerialQueue) Clear() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.data = q.data[:0]
-}
-
+// Parses and returns bluetooth UUIDs of device {s}
 func mustParseUUID(s string) bluetooth.UUID {
 	uuid, err := bluetooth.ParseUUID(s)
 	if err != nil {
@@ -91,21 +60,25 @@ func mustParseUUID(s string) bluetooth.UUID {
 	return uuid
 }
 
+
+// Scans for Arduino device automatically
+// Supports Linux (/dev/ttyACM) (/dev/ttyUSB)
+// Supports macOS (/dev/tty.usbmodem) (/dev/tty.usbmodem) (C)
+// Supports Windows (COM1) ... (COM32)
 func findArduino() (string, error) {
 	var potentialPorts []string
 
-	if runtime.GOOS == "windows" {
-		// Windows: Check COM ports 1-32 (most common range)
+	if runtime.GOOS == "windows" { // Windows: Check COM ports 1-32 (most common range)
+
 		for i := 1; i <= 32; i++ {
 			potentialPorts = append(potentialPorts, fmt.Sprintf("COM%d", i))
 		}
-	} else {
-		// Unix-like systems (Linux/macOS)
+	} else { // Unix-like systems (Linux/macOS)
 		patterns := []string{
 			"/dev/ttyACM*",        // Linux Arduino
 			"/dev/ttyUSB*",        // Linux Serial Adapters
 			"/dev/tty.usbmodem*",  // macOS Arduino
-			"/dev/tty.usbserial*", // macOS Serial Adapters
+			"C*", // macOS Serial Adapters
 		}
 
 		for _, pattern := range patterns {
@@ -120,17 +93,16 @@ func findArduino() (string, error) {
 
 	log.Printf("Scanning %d potential ports for Arduino...", len(potentialPorts))
 
-	// 2. Iterate through them
 	for _, port := range potentialPorts {
 		c := &serial.Config{
 			Name:        port,
 			Baud:        ARDUINO_BAUDRATE,
-			ReadTimeout: 500 * time.Millisecond, // Short timeout for checking
+			ReadTimeout: 500 * time.Millisecond,
 		}
 
 		s, err := serial.OpenPort(c)
 		if err != nil {
-			// On Windows, failed opens are common (port doesn't exist), so we can skip logging or log verbose only
+			// Windows does't have logging support, so we just fail.
 			if runtime.GOOS != "windows" {
 				log.Printf("  -> Failed to open %s: %v", port, err)
 			}
@@ -139,10 +111,9 @@ func findArduino() (string, error) {
 
 		log.Printf("Checking port %s...", port)
 
-		// 3. Handshake attempt
+		// Handshake Attempt
 		s.Flush()
 
-		// Write 'g' trigger
 		_, err = s.Write([]byte{'g'})
 		if err != nil {
 			s.Close()
@@ -152,26 +123,25 @@ func findArduino() (string, error) {
 		// Read response
 		buf := make([]byte, 128)
 		n, err := s.Read(buf)
-		s.Close() // Close immediately after check
+		s.Close()
 
 		if err != nil && err.Error() != "EOF" {
-			 log.Printf("  -> Read error on %s", port)
-			 continue
+			log.Printf("  -> Read error on %s", port)
+			continue
 		}
 
+		// Scan for sensor data to ensure connection.
 		if n > 0 {
 			response := strings.TrimSpace(string(buf[:n]))
-			// Check if it looks like a number (sensor data)
 			if _, err := strconv.ParseFloat(response, 64); err == nil {
 				log.Printf("  -> FOUND! Valid sensor data on %s: '%s'", port, response)
 				return port, nil
 			}
-			 log.Printf("  -> Invalid response on %s: '%s'", port, response)
+			log.Printf("  -> Invalid response on %s: '%s'", port, response)
 		} else {
-			 log.Printf("  -> No response on %s", port)
+			log.Printf("  -> No response on %s", port)
 		}
 	}
-
 	return "", fmt.Errorf("arduino not found on any port")
 }
 
@@ -184,7 +154,7 @@ func SerialReader(port *serial.Port, queue *SerialQueue, ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
-			// Request data
+			// Requesting and Enqueueing Data
 			_, err := port.Write([]byte{'g'})
 			if err != nil {
 				log.Printf("Error writing to serial: %v", err)
@@ -192,15 +162,14 @@ func SerialReader(port *serial.Port, queue *SerialQueue, ctx context.Context) {
 				continue
 			}
 
-			// Read response with timeout
 			line, err := reader.ReadString('\n')
 			if err != nil {
-				// Check if it's a timeout or actual error
+
 				if err.Error() == "EOF" || strings.Contains(err.Error(), "timeout") {
-					// Timeout or EOF - just try again
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
+
 				log.Printf("Error reading from serial: %v", err)
 				time.Sleep(2 * time.Second)
 				continue
@@ -226,6 +195,7 @@ type BLEController struct {
 	maxChunkSize     int
 }
 
+// Returns a new BLE Controller
 func NewBLEController() (*BLEController, error) {
 	adapter := bluetooth.DefaultAdapter
 	err := adapter.Enable()
@@ -239,6 +209,9 @@ func NewBLEController() (*BLEController, error) {
 	}, nil
 }
 
+// 1. Scan for bluetooth device that matches our UUID
+// 2. Once found, Connect to the device
+// 3. Discover device characteristics and enable notifications
 func (b *BLEController) ScanAndConnect(ctx context.Context) error {
 	log.Println("Scanning for SPIKE Prime hub...")
 
@@ -317,6 +290,7 @@ func (b *BLEController) ScanAndConnect(ctx context.Context) error {
 
 	return nil
 }
+
 
 func (b *BLEController) onData(data []byte) {
 	if len(data) == 0 {
@@ -806,6 +780,58 @@ motor.stop(port.C, stop_action='hold')
 `
                 bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
                 log.Println("Adjustment complete. Stopping.")
+            }
+
+			// Case 3: Value is PERFECT. Start Scanning (Motor B)
+            if currentValue < SETPOINT_RANGE_HIGH  && currentValue > SETPOINT_RANGE_LOW {
+                log.Printf("Value %.0f is PERFECT. Starting continuous scan...", currentValue)
+
+                // 1. Start Motor (SCAN)
+                programCode := fmt.Sprintf(`import motor
+from hub import port
+import time
+motor.run(port.B, -%d)
+while True:
+    time.sleep(1)
+`, MOTOR_SPEED)
+
+                err := bleController.UploadAndRun(ctx, []byte(programCode), PROGRAM_SLOT)
+                if err != nil {
+                    log.Printf("Failed to start motor: %v", err)
+                    continue
+                }
+
+                // 2. Loop until back in range
+                for {
+                    var reading string
+                    var found bool
+                    for {
+                        l, ok := serialQueue.Get()
+                        if !ok { break }
+                        reading = l
+                        found = true
+                    }
+
+                    if !found {
+                        time.Sleep(50 * time.Millisecond)
+                        continue
+                    }
+
+                    val, _ := strconv.ParseFloat(reading, 64)
+                    // If we go out of bounds, break this loop to stop Motor B and let outer loop handle A/C
+                    if val > SETPOINT_RANGE_HIGH || val < SETPOINT_RANGE_LOW {
+                        break
+                    }
+                    time.Sleep(50 * time.Millisecond)
+                }
+
+                // 3. Stop Motor
+                stopCode := `import motor
+from hub import port
+motor.stop(port.B, stop_action='hold')
+`
+                bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+                log.Println("Scan interrupted by sensor. Stopping.")
             }
 		}
 	}
