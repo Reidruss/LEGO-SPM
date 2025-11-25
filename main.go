@@ -1,7 +1,16 @@
+/*
+    Developed by Reid Russell
+    Co-Developed by Julian Lee
+    University of Tennessee, Knoxville Research
+
+    Pipeline for communication from Arduino R4 to LEGO Spike Prime
+      Flex Sensor --> Arduino --> main.go --> LEGO Spike Prime
+*/
+
 package main
 
 import (
-  "bufio"
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -18,11 +27,11 @@ import (
 )
 
 const (
-	SCAN_TIMEOUT                     = 25 * time.Second
-	ARDUINO_PORT                     = "/dev/ttyACM0"
-	ARDUINO_BAUDRATE                 = 9600
-	DEVICE_NOTIFICATION_INTERVAL_MS  = 5000
-	PROGRAM_SLOT                     = 2
+	SCAN_TIMEOUT                    = 25 * time.Second
+	ARDUINO_PORT                    = "/dev/ttyACM0"
+	ARDUINO_BAUDRATE                = 9600
+	DEVICE_NOTIFICATION_INTERVAL_MS = 5000
+	PROGRAM_SLOT                    = 2
 
 	// BLE UUIDs for SPIKE Prime
 	SERVICE = "0000fd02-0000-1000-8000-00805f9b34fb"
@@ -30,69 +39,12 @@ const (
 	TX_CHAR = "0000fd02-0002-1000-8000-00805f9b34fb"
 )
 
-// PID Controller parameters
+// Threshold parameters
 const (
-	KP                  = 0.5
-	KI                  = 0.1
-	KD                  = 0.05
 	SETPOINT_RANGE_LOW  = 4000
-	SETPOINT_RANGE_HIGH = 6000
-	MOTOR_SPEED         = 30
+	SETPOINT_RANGE_HIGH = 8000
+	MOTOR_SPEED         = 55
 )
-
-// PIDController implements a PID controller
-type PIDController struct {
-	kp             float64
-	ki             float64
-	kd             float64
-	setpointLow    float64
-	setpointHigh   float64
-	integral       float64
-	previousError  float64
-}
-
-func NewPIDController(kp, ki, kd, low, high float64) *PIDController {
-	return &PIDController{
-		kp:           kp,
-		ki:           ki,
-		kd:           kd,
-		setpointLow:  low,
-		setpointHigh: high,
-		integral:     0,
-		previousError: 0,
-	}
-}
-
-func (p *PIDController) Update(currentValue float64) float64 {
-	var err float64
-
-	// Case 1: Within acceptable range → do nothing
-	if currentValue >= p.setpointLow && currentValue <= p.setpointHigh {
-		p.integral = 0
-        p.previousError = 0
-		return 0
-	}
-
-	// Case 2: Below range (too low) → want positive output
-	if currentValue < p.setpointLow {
-		err = currentValue - p.setpointLow // will be negative → output positive
-	}
-
-	// Case 3: Above range (too high) → want negative output
-	if currentValue > p.setpointHigh {
-		err = currentValue - p.setpointHigh // will be positive → output negative
-	}
-
-	// PID math
-	p.integral += err
-	derivative := err - p.previousError
-	p.previousError = err
-
-	output := (p.kp * err) + (p.ki * p.integral) + (p.kd * derivative)
-
-	return output
-}
-
 
 // SerialQueue manages serial data in a thread-safe way
 type SerialQueue struct {
@@ -174,7 +126,7 @@ func SerialReader(port *serial.Port, queue *SerialQueue, ctx context.Context) {
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-	}
+    }
 }
 
 // BLEController manages BLE communication
@@ -286,8 +238,7 @@ func (b *BLEController) onData(data []byte) {
 		return
 	}
 
-	//log.Printf("onData: raw notification (%d bytes): % x", len(data), data)
-
+    // Check for framing (Expected 0x02 ETX)
 	if data[len(data)-1] != 0x02 {
 		xorred := make([]byte, len(data))
 		for i := range data {
@@ -298,7 +249,6 @@ func (b *BLEController) onData(data []byte) {
 	}
 
 	unpacked := Unpack(data)
-	//log.Printf("onData: unpacked payload (%d bytes): % x", len(unpacked), unpacked)
 
 	if len(unpacked) == 0 {
 		log.Println("onData: unpacked to empty payload")
@@ -316,8 +266,6 @@ func (b *BLEController) onData(data []byte) {
 		default:
 			log.Printf("Response channel for msgID 0x%02X is full, dropping message", msgID)
 		}
-	} else {
-		// log.Printf("Received unsolicited message with ID 0x%02X", msgID)
 	}
 }
 
@@ -331,11 +279,9 @@ func (b *BLEController) SendRequestWithResponse(message BaseMessage, responseID 
 		b.pendingMu.Lock()
 		delete(b.pendingResponses, responseID)
 		b.pendingMu.Unlock()
-		close(respChan)
 	}()
 
 	frame := Pack(message.Serialize())
-	//log.Printf("SendRequest: sending frame (%d bytes): % x", len(frame), frame)
 
 	_, err := b.rxChar.WriteWithoutResponse(frame)
 	if err != nil {
@@ -350,130 +296,54 @@ func (b *BLEController) SendRequestWithResponse(message BaseMessage, responseID 
 	}
 }
 
-func (b *BLEController) UploadAndRunWait(ctx context.Context, programCode []byte, slot int) error {
-	programCRC := CRC(programCode, 0, 4)
-
-	log.Printf("Uploading program (CRC: 0x%08x)", programCRC)
-
-		startUploadReq := StartFileUploadRequest{
-		FileName: "program.py",
-		Slot:     byte(slot),
-		CRC:      programCRC,
-	}
-	respBytes, err := b.SendRequestWithResponse(startUploadReq, StartFileUploadResponse{}.GetID())
-	if err != nil {
-		return fmt.Errorf("start upload request failed: %w", err)
-	}
-	startResp, err := DeserializeStartFileUploadResponse(respBytes)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize start upload response: %w", err)
-	}
-	if !startResp.Success {
-		return fmt.Errorf("start upload failed (hub response)")
-	}
-
-	runningCRC := uint32(0)
-	for i := 0; i < len(programCode); i += b.maxChunkSize {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		end := i + b.maxChunkSize
-		if end > len(programCode) {
-			end = len(programCode)
-		}
-		chunk := programCode[i:end]
-		runningCRC = CRC(chunk, runningCRC, 4)
-
-		chunkReq := TransferChunkRequest{
-
-			RunningCRC: runningCRC,
-			Payload:    chunk,
-		}
-		respBytes, err := b.SendRequestWithResponse(chunkReq, TransferChunkResponse{}.GetID())
-		if err != nil {
-			return fmt.Errorf("chunk transfer request failed: %w", err)
-		}
-		chunkResp, err := DeserializeTransferChunkResponse(respBytes)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize chunk response: %w", err)
-		}
-		if !chunkResp.Success {
-			return fmt.Errorf("chunk transfer failed (hub response)")
-		}
-	}
-
-	// Step 3: Start the program
+// Helper to ensure any running program is stopped before upload
+func (b *BLEController) StopProgram(ctx context.Context, slot int) {
 	programFlowReq := ProgramFlowRequest{
-		Stop: false,
+		Stop: true,
 		Slot: byte(slot),
 	}
-	respBytes, err = b.SendRequestWithResponse(programFlowReq, ProgramFlowResponse{}.GetID())
-	if err != nil {
-		return fmt.Errorf("program flow request failed: %w", err)
-	}
-	flowResp, err := DeserializeProgramFlowResponse(respBytes)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize program flow response: %w", err)
-	}
-	if !flowResp.Success {
-		return fmt.Errorf("failed to start program (hub response)")
-	}
-
-
-	programFlowNotif := ProgramFlowNotification {
-		Stop: false,
-	}
-	respBytesNotif, err := b.SendRequestWithResponse(programFlowNotif, ProgramFlowNotification{}.GetID())
-	if err != nil {
-		return fmt.Errorf("program flow request failed: %w", err)
-	}
-	flowRespNotif, err := DeserializeProgramFlowNotification(respBytesNotif)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize program flow response: %w", err)
-	}
-
-	for flowRespNotif.Stop {
-		respBytesNotif, err = b.SendRequestWithResponse(programFlowNotif, ProgramFlowNotification{}.GetID())
-		if err != nil {
-			return fmt.Errorf("program flow request failed: %w", err)
-		}
-
-		flowRespNotif, err = DeserializeProgramFlowNotification(respBytesNotif)
-		if err != nil {
-			return fmt.Errorf("failed to deserialize program flow response: %w", err)
-		}
-	}
-
-	log.Println("Program started and ended successfully.")
-	return nil
+	// We make a best-effort attempt to stop.
+	b.SendRequestWithResponse(programFlowReq, ProgramFlowResponse{}.GetID())
 }
 
 func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, slot int) error {
+	// 1. Explicitly stop previous program to clear Hub state
+	b.StopProgram(ctx, slot)
+	time.Sleep(200 * time.Millisecond)
+
 	programCRC := CRC(programCode, 0, 4)
 	log.Printf("Uploading program (CRC: 0x%08x)", programCRC)
 
-	// Step 1: Start file upload
+	// Step 2: Start file upload (WITH RETRY LOGIC)
 	startUploadReq := StartFileUploadRequest{
 		FileName: "program.py",
 		Slot:     byte(slot),
 		CRC:      programCRC,
 	}
-	respBytes, err := b.SendRequestWithResponse(startUploadReq, StartFileUploadResponse{}.GetID())
-	if err != nil {
-		return fmt.Errorf("start upload request failed: %w", err)
-	}
-	startResp, err := DeserializeStartFileUploadResponse(respBytes)
-	if err != nil {
-		return fmt.Errorf("failed to deserialize start upload response: %w", err)
-	}
-	if !startResp.Success {
-		return fmt.Errorf("start upload failed (hub response)")
+
+	var err error
+	success := false
+
+	// Retry up to 5 times. This may not be the issue.
+	for attempt := 1; attempt <= 5; attempt++ {
+		var respBytes []byte
+		respBytes, err = b.SendRequestWithResponse(startUploadReq, StartFileUploadResponse{}.GetID())
+		if err == nil {
+			startResp, err := DeserializeStartFileUploadResponse(respBytes)
+			if err == nil && startResp.Success {
+				success = true
+				break
+			}
+		}
+		log.Printf("Start upload attempt %d failed. Retrying...", attempt)
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	// Step 2: Send chunks
+	if !success {
+		return fmt.Errorf("failed to start upload after 3 attempts: %v", err)
+	}
+
+	// Step 3: Send chunks
 	runningCRC := uint32(0)
 	for i := 0; i < len(programCode); i += b.maxChunkSize {
 		select {
@@ -482,15 +352,11 @@ func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, sl
 		default:
 		}
 
-		end := i + b.maxChunkSize
-		if end > len(programCode) {
-			end = len(programCode)
-		}
+		end := min(i + b.maxChunkSize, len(programCode))
 		chunk := programCode[i:end]
 		runningCRC = CRC(chunk, runningCRC, 4)
 
 		chunkReq := TransferChunkRequest{
-
 			RunningCRC: runningCRC,
 			Payload:    chunk,
 		}
@@ -507,12 +373,13 @@ func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, sl
 		}
 	}
 
-	// Step 3: Start the program
+	// Step 4: Start the program
 	programFlowReq := ProgramFlowRequest{
 		Stop: false,
 		Slot: byte(slot),
 	}
-	respBytes, err = b.SendRequestWithResponse(programFlowReq, ProgramFlowResponse{}.GetID())
+
+	respBytes, err := b.SendRequestWithResponse(programFlowReq, ProgramFlowResponse{}.GetID())
 	if err != nil {
 		return fmt.Errorf("program flow request failed: %w", err)
 	}
@@ -526,21 +393,6 @@ func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, sl
 
 	log.Println("Program started successfully.")
 	return nil
-}
-
-func clamp(value, min, max float64) float64 {
-
-	if value == 0 {
-		return value;
-	}
-
-	if value < min {
-		return min
-	}
-	if value > max {
-		return max
-	}
-	return value
 }
 
 func main() {
@@ -580,13 +432,10 @@ func main() {
 		log.Fatalf("Failed to open serial port: %v", err)
 	}
 
-    // --- NEW: FLUSH BUFFER ---
     // Flush the OS buffer to remove stale data from the previous run
-    // This fixes the issue where it reads old values on restart
 	if err := serialPort.Flush(); err != nil {
 		log.Printf("Warning: Failed to flush serial buffer: %v", err)
 	}
-    // -------------------------
 
 	defer serialPort.Close()
 
@@ -630,7 +479,7 @@ func main() {
 	log.Println("Waiting for initial sensor value from Arduino...")
 	var line string
 	var ok bool
-	for i := 0; i < 20; i++ { // Try for 2 seconds
+	for range 20 { // Try for 2 seconds
 		line, ok = serialQueue.Get()
 		if ok {
 			break
@@ -717,7 +566,7 @@ motor.stop(port.C, stop_action='hold')
 	time.Sleep(500 * time.Millisecond)
 
     // =========================================================================
-    // MAIN CONTROL LOOP (Replaces PID with Threshold/Bang-Bang Logic)
+    // MAIN CONTROL LOOP
     // =========================================================================
 	log.Println("Starting main control loop...")
 
@@ -756,7 +605,6 @@ motor.stop(port.C, stop_action='hold')
 			}
 
             // Case 1: Value is too LOW. (Needs to tighten)
-            // We reuse the exact logic from calibration.
             if currentValue < SETPOINT_RANGE_LOW {
                 log.Printf("Value %.0f is LOW. Starting continuous adjustment...", currentValue)
 
@@ -813,12 +661,11 @@ motor.stop(port.C, stop_action='hold')
                 log.Println("Adjustment complete. Stopping.")
             }
 
-            // Case 2: Value is too HIGH. (Needs to loosen)
-            // Same logic, reversed direction.
+            // Case 2: Value is too HIGH. (Raise up)
             if currentValue > SETPOINT_RANGE_HIGH {
                 log.Printf("Value %.0f is HIGH. Starting continuous adjustment...", currentValue)
 
-                // 1. Start Motor (Reversed)
+                // 1. Start Motor (RAISE)
                 programCode := fmt.Sprintf(`import motor
 from hub import port
 import time
@@ -870,4 +717,3 @@ motor.stop(port.C, stop_action='hold')
 		}
 	}
 }
-
