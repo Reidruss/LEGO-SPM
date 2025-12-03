@@ -42,8 +42,9 @@ The LEGO SPM controller is composed of the following Go scripts:
 ## Setup
 
 1.  **Arduino:**
-    *   Connect the flex sensor to the Arduino R4.
-    *   Upload an Arduino sketch that reads the sensor value and writes it to the serial port. The Go script expects the Arduino to be on port `/dev/ttyACM0` with a baud rate of 9600.
+    *   Connect the flex sensor to the Arduino R4 through.
+    *   Upload an Arduino sketch that reads the sensor value and writes it to the serial port. The Go script will scan ports on macOs, Linux, and Windows.
+<img width="864" height="540" alt="Screenshot from 2025-12-03 16-19-41" src="https://github.com/user-attachments/assets/f5307260-8c9a-4884-b9b7-5408a4052ddc" />
 
 2.  **Go Environment:**
     *   Install the required Go packages:
