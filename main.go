@@ -44,9 +44,9 @@ const (
 
 // Threshold parameters & Motor Speed
 const (
-	SETPOINT_RANGE_LOW  = 3750
-	SETPOINT_RANGE_HIGH = 6000
-	MOTOR_SPEED         = 50
+	SETPOINT_RANGE_LOW  = 3000
+	SETPOINT_RANGE_HIGH = 4500
+	MOTOR_SPEED         = 40
 )
 
 
@@ -712,7 +712,7 @@ while True:
 
                     val, _ := strconv.ParseFloat(reading, 64)
                     // Stop if we cross the low threshold back into safety
-                    if val >= SETPOINT_RANGE_LOW {
+                    if val >= SETPOINT_RANGE_LOW + 200 {
                         break
                     }
                     time.Sleep(50 * time.Millisecond)
@@ -725,6 +725,7 @@ motor.stop(port.A, stop_action='hold')
 motor.stop(port.C, stop_action='hold')
 `
                 bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+				time.Sleep(50 * time.Millisecond)
                 log.Println("Adjustment complete. Stopping.")
             }
 
@@ -766,7 +767,7 @@ while True:
 
                     val, _ := strconv.ParseFloat(reading, 64)
                     // Stop if we cross the high threshold back into safety
-                    if val <= SETPOINT_RANGE_HIGH {
+                    if val <= SETPOINT_RANGE_HIGH - 200 {
                         break
                     }
                     time.Sleep(50 * time.Millisecond)
@@ -779,6 +780,7 @@ motor.stop(port.A, stop_action='hold')
 motor.stop(port.C, stop_action='hold')
 `
                 bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+				time.Sleep(50 * time.Millisecond)
                 log.Println("Adjustment complete. Stopping.")
             }
 
@@ -819,7 +821,7 @@ while True:
 
                     val, _ := strconv.ParseFloat(reading, 64)
                     // If we go out of bounds, break this loop to stop Motor B and let outer loop handle A/C
-                    if val > SETPOINT_RANGE_HIGH || val < SETPOINT_RANGE_LOW {
+                    if val > SETPOINT_RANGE_HIGH + 200 || val < SETPOINT_RANGE_LOW - 200 {
                         break
                     }
                     time.Sleep(50 * time.Millisecond)
@@ -831,6 +833,7 @@ from hub import port
 motor.stop(port.B, stop_action='hold')
 `
                 bleController.UploadAndRun(ctx, []byte(stopCode), PROGRAM_SLOT)
+				time.Sleep(50 * time.Millisecond)
                 log.Println("Scan interrupted by sensor. Stopping.")
             }
 		}
