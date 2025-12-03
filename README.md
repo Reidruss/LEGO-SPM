@@ -42,7 +42,7 @@ The LEGO SPM controller is composed of the following Go scripts:
 ## Setup
 
 1.  **Arduino:**
-    *   Connect the flex sensor to the Arduino R4 through.
+    *   Connect the flex sensor to the Arduino R4. A screenshot is given below of the wiring setup for the flex sensor.
     *   Upload an Arduino sketch that reads the sensor value and writes it to the serial port. The Go script will scan ports on macOs, Linux, and Windows.
 <img width="864" height="540" alt="Screenshot from 2025-12-03 16-19-41" src="https://github.com/user-attachments/assets/f5307260-8c9a-4884-b9b7-5408a4052ddc" />
 
@@ -52,9 +52,13 @@ The LEGO SPM controller is composed of the following Go scripts:
         go get github.com/tarm/serial
         go get tinygo.org/x/bluetooth
         ```
+    *   These will install automatically with:
+        ```bash
+        go build .
+        ```
 
 3.  **LEGO Spike Prime:**
-    *   Ensure the Spike Prime hub is integrated into your SPM structure, powered on, and discoverable via Bluetooth.
+    *   Ensure the Spike Prime hub is integrated into your SPM structure, powered on, and connected to your machine, via Bluetooth.
 
 ## Usage
 
@@ -66,8 +70,9 @@ The LEGO SPM controller is composed of the following Go scripts:
 2.  The script will prompt you to confirm that you want to override the program in the specified slot on the Spike Prime. Press `Y` and Enter to continue.
 
 3.  The script will then perform the following steps:
-    *   Scan for and connect to the Spike Prime hub.
-    *   Perform a calibration sequence to bring the SPM tip close to the sample surface.
+    *   Scan for the Arduino Serial Port.
+    *   Scan for the LEGO Spike Prime hub.
+    *   Perform a calibration sequence to bring the SPM tip in contact to the sample surface.
     *   Enter a main control loop where it continuously reads sensor data from the Arduino and adjusts the SPM's motors to maintain a constant tip-sample distance.
 
 ## Communication Protocol
@@ -82,4 +87,4 @@ The communication with the LEGO Spike Prime hub is based on a custom protocol th
 
 The `main.go` script first establishes a serial connection with the Arduino and a BLE connection with the Spike Prime hub. It then enters a calibration phase where it runs a motor on the SPM to bring the tip into contact with the sample surface, detected by a change in the flex sensor's reading.
 
-After calibration, the script enters a continuous control loop. In this loop, it reads the flex sensor data from the Arduino and adjusts the SPM's motors to maintain a constant setpoint, effectively keeping the tip at a fixed distance from the sample. The script sends Python code to the Spike Prime to control the motors, demonstrating the ability to dynamically program the hub for sophisticated SPM control.
+After calibration, the script enters a continuous control loop. In this loop, it reads the flex sensor data from the Arduino and adjusts the SPM's motors to maintain a constant setpoint, effectively keeping the tip at a fixed distance from the sample. The script sends microPython code to the Spike Prime to control the motors, demonstrating the ability to dynamically program the hub for sophisticated SPM control.
