@@ -1,6 +1,5 @@
 package main
 
-// CRC calculates CRC32 for the given data, matching the Python implementation.
 func CRC(data []byte, runningCRC uint32, num int) uint32 {
 	if num == 4 {
 		// Pad data to a multiple of 4 bytes
@@ -10,7 +9,6 @@ func CRC(data []byte, runningCRC uint32, num int) uint32 {
 			data = append(data, padding...)
 		}
 
-		// Standard CRC32 implementation to match Python version
 		crcVal := 0xFFFFFFFF ^ runningCRC
 		for _, b := range data {
 			crcVal ^= uint32(b)
@@ -24,7 +22,7 @@ func CRC(data []byte, runningCRC uint32, num int) uint32 {
 		}
 		return 0xFFFFFFFF ^ crcVal
 	}
-	// A different CRC calculation for num=1
+	
 	crcVal := runningCRC
 	for _, b := range data {
 		crcVal = (crcVal + uint32(b))
