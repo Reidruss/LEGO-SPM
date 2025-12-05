@@ -1,0 +1,6 @@
+go.mod
+go.sum
+m.exe
+m
+.venv/
+__pycache__/

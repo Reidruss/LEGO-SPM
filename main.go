@@ -50,6 +50,7 @@ const (
 )
 
 
+/* ==== HELPER FUNCTIONS ==== */
 
 // Parses and returns bluetooth UUIDs of device {s}
 func mustParseUUID(s string) bluetooth.UUID {
@@ -59,7 +60,6 @@ func mustParseUUID(s string) bluetooth.UUID {
 	}
 	return uuid
 }
-
 
 // Scans for Arduino device automatically
 // Supports Linux (/dev/ttyACM) (/dev/ttyUSB)
@@ -175,6 +175,7 @@ func SerialReader(port *serial.Port, queue *SerialQueue, ctx context.Context) {
 				continue
 			}
 
+			// Placing resistance value into queue
 			resistance := strings.TrimSpace(line)
 			if resistance != "" {
 				queue.Put(resistance)
@@ -308,6 +309,7 @@ func (b *BLEController) onData(data []byte) {
 		return
 	}
 
+	// unpack data (XOR each byte, then COBS decode)
 	unpacked := Unpack(data)
 
 	if len(unpacked) == 0 {
@@ -341,6 +343,7 @@ func (b *BLEController) SendRequestWithResponse(message BaseMessage, responseID 
 		b.pendingMu.Unlock()
 	}()
 
+	// XOR + COBS + DELIMITER
 	frame := Pack(message.Serialize())
 
 	_, err := b.rxChar.WriteWithoutResponse(frame)
@@ -362,7 +365,7 @@ func (b *BLEController) StopProgram(ctx context.Context, slot int) {
 		Stop: true,
 		Slot: byte(slot),
 	}
-	// We make a best-effort attempt to stop.
+	// We make an attempt to stop.
 	b.SendRequestWithResponse(programFlowReq, ProgramFlowResponse{}.GetID())
 }
 
@@ -384,7 +387,7 @@ func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, sl
 	var err error
 	success := false
 
-	// Retry up to 5 times. This may not be the issue.
+	// Retry up to 5 times. This may not be the issue. TEMPORARY WORKAROUND.
 	for attempt := 1; attempt <= 5; attempt++ {
 		var respBytes []byte
 		respBytes, err = b.SendRequestWithResponse(startUploadReq, StartFileUploadResponse{}.GetID())
@@ -455,8 +458,10 @@ func (b *BLEController) UploadAndRun(ctx context.Context, programCode []byte, sl
 	return nil
 }
 
+/* ==== MAIN FUNCTION ==== */
+
 func main() {
-	fmt.Printf("This example will override the program in slot %d. Continue? [Y/n] ", PROGRAM_SLOT)
+	fmt.Printf("This script will override the program in slot %d. Continue? [Y/n] ", PROGRAM_SLOT)
 
 	reader := bufio.NewReader(os.Stdin)
 	answer, _ := reader.ReadString('\n')
@@ -469,7 +474,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle interrupt signal
+	// Handle interrupt signal (Ctrl+C)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -481,6 +486,11 @@ func main() {
 		os.Exit(0)
 	}()
 
+	// =========================================================================
+	// INITIAL SETUP
+	// =========================================================================
+
+	// Discover Arduino serial port
 	log.Println("Searching for Arduino...")
     arduinoPortName, err := findArduino()
     if err != nil {
@@ -543,6 +553,7 @@ func main() {
     // =========================================================================
     // CALIBRATION SEQUENCE
     // =========================================================================
+
 	log.Println("Waiting for initial sensor value from Arduino...")
 	var line string
 	var ok bool
@@ -564,7 +575,7 @@ func main() {
 
 	log.Printf("Current Value: %.2f", current_value)
 
-    // Calibration: If too low, tighten until contact
+	// === CALIBRATION: Move until contact is detected ===
 	if current_value < SETPOINT_RANGE_LOW {
 		programCode := fmt.Sprintf(`import motor
 from hub import port
@@ -612,6 +623,7 @@ while True:
 			continue
 		}
 
+		// We stop the motor if contact is detected within the range
 		if current_value > SETPOINT_RANGE_LOW {
 			programCode := `import motor
 from hub import port
@@ -671,7 +683,7 @@ motor.stop(port.C, stop_action='hold')
 				continue
 			}
 
-            // Case 1: Value is too LOW. (Needs to tighten)
+            // Case 1: Value is too LOW. (Needs to Lower)
             if currentValue < SETPOINT_RANGE_LOW {
                 log.Printf("Value %.0f is LOW. Starting continuous adjustment...", currentValue)
 
@@ -729,7 +741,7 @@ motor.stop(port.C, stop_action='hold')
                 log.Println("Adjustment complete. Stopping.")
             }
 
-            // Case 2: Value is too HIGH. (Raise up)
+            // Case 2: Value is too HIGH. (NEED to Raise)
             if currentValue > SETPOINT_RANGE_HIGH {
                 log.Printf("Value %.0f is HIGH. Starting continuous adjustment...", currentValue)
 
@@ -784,9 +796,9 @@ motor.stop(port.C, stop_action='hold')
                 log.Println("Adjustment complete. Stopping.")
             }
 
-			// Case 3: Value is PERFECT. Start Scanning (Motor B)
+			// Case 3: Value is approximately WITHIN RANGE. Start Scanning (Motor B)
             if currentValue < SETPOINT_RANGE_HIGH  && currentValue > SETPOINT_RANGE_LOW {
-                log.Printf("Value %.0f is PERFECT. Starting continuous scan...", currentValue)
+                log.Printf("Value %.0f is IN RANGE. Starting continuous scan...", currentValue)
 
                 // 1. Start Motor (SCAN)
                 programCode := fmt.Sprintf(`import motor
