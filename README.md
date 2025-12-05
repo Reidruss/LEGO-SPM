@@ -60,6 +60,28 @@ The LEGO SPM controller is composed of the following Go scripts:
 3.  **LEGO Spike Prime:**
     *   Ensure the Spike Prime hub is integrated into your SPM structure, powered on, and connected to your machine, via Bluetooth.
 
+## Configuration
+Before running the script, you must calibrate the constants in `main.go` to match your specific hardware setup.
+
+1. **Motor Speed (`MOTOR_SPEED`)
+   * **Recommendation:** Set between **40 and 60**.
+   * **< 40:** Risk of motor "cogging" (stuttering) and stiction, preventing fine adjustments.
+   * **> 60:** Risk of overshoot; the SPM may struggle to settle within the setpoint range.
+2. **Thresholds (`SETPOINT_RANGE`)** to determine your values:
+   1. Read the baseline resistance value of the sensor when the tip is not in contact with the sample.
+   2. Set `SETPOINT_RANGE_LOW` to a value approximately **1000–2000 units greater** than your baseline.
+   3. Set `SETPOINT_RANGE_HIGH` to define the upper limit of the acceptable range.
+
+Open `main.go` and modify the constants block:
+```go
+const (
+    SETPOINT_RANGE_LOW  = 3750 // Baseline + Buffer
+    SETPOINT_RANGE_HIGH = 6000 // Upper limit
+    MOTOR_SPEED         = 50   // Recommended: 40 to 60
+)
+```
+
+
 ## Usage
 
 1.  Run the `main.go` script:
@@ -69,11 +91,14 @@ The LEGO SPM controller is composed of the following Go scripts:
 
 2.  The script will prompt you to confirm that you want to override the program in the specified slot on the Spike Prime. Press `Y` and Enter to continue.
 
-3.  The script will then perform the following steps:
-    *   Scan for the Arduino Serial Port.
-    *   Scan for the LEGO Spike Prime hub.
-    *   Perform a calibration sequence to bring the SPM tip in contact to the sample surface.
-    *   Enter a main control loop where it continuously reads sensor data from the Arduino and adjusts the SPM's motors to maintain a constant tip-sample distance.
+## Runtime Process
+Once confirmed, the script performs the following sequence:
+1. **Connection:** Scans for the Arduino Serial Port and the LEGO Spike Prime hub.
+2. **Calibration:** Performs a sequence to bring the SPM tip into contact with the sample surface.
+3. **Control Loop:** Enters the main feedback loop. It continuously reads sensor data from the Arduino and adjusts the SPM's motors to maintain the tip-sample distance within your configured thresholds.
+  * **If Value < Low:** The tip is pressing too hard (or too close). The script runs Motors A & C to retract/tighten the assembly.
+  * **If Value > High:** The tip is too far (or too loose). The script runs Motors A & C to extend/loosen the assembly.
+  * **If Value is within Range:** The tip is perfectly positioned. The script runs Motor B to scan across the surface (X/Y axis).
 
 ## Communication Protocol
 
